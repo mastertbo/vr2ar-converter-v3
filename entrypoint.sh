@@ -1,3 +1,3 @@
 #!/usr/bin/env sh
 
-python3 /app/main.py
+python3 -u /app/main.py
