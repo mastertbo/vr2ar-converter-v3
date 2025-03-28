@@ -1,0 +1,13 @@
+name: container
+
+on:
+  push:
+    tags:
+    - "v*.*.*"
+    - "v*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: https://git.k8s.lan/actions/container/.gitea/workflows/container.yaml@v1
+    secrets: inherit
