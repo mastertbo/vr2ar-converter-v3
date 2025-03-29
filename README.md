@@ -10,7 +10,7 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
 ## Usage
 
 1. Create smal video chunks you want to convert to passthrough with no scene changes (i recommend chunks with length smaler than 3 minutes)
-2. Process these chuuks via the provided gradio webui
+2. Process these chunks via the provided gradio webui
 3. Wait for complete of process.
 4. Download the result
 5. Combine your chunks back into on video
