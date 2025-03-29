@@ -15,6 +15,9 @@ import shutil
 import torch
 import cv2
 import gc
+import time
+import threading
+import queue
 import random
 from sam2_executor import GroundingDinoSAM2Segment
 
@@ -24,8 +27,10 @@ import numpy as np
 from matanyone.model.matanyone import MatAnyone
 from matanyone.inference.inference_core import InferenceCore
 
+WORKER_STATUS = "Idle"
 
-def ffmpeg(cmd, progress, total_frames, process_start, process_end):
+def ffmpeg(cmd, total_frames):
+    global WORKER_STATUS
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
             
     for line in process.stdout:
@@ -34,16 +39,17 @@ def ffmpeg(cmd, progress, total_frames, process_start, process_end):
             parts = line.split()
             try:
                 current_frame = int(parts[1])
-                progress(process_start + (current_frame / total_frames) * (process_end - process_start), desc="Converting")
+                percent = round((current_frame / total_frames) * 100, 1)
+                WORKER_STATUS = f"Converting Video via FFmpeg {percent}%" 
             except ValueError:
                 pass
     
     process.wait()
     
     if process.returncode != 0:
-        print(cmd)
+        print("ERROR", cmd)
         return False
-    
+
     return True
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
@@ -110,15 +116,14 @@ def prepare_frame(frame, has_cuda=True):
     return image_input
 
 @torch.no_grad()
-def process(video, projection, mode, progress=gr.Progress()):
-    if video is None:
-        return None, None, "No video uploaded"
-    
-    progress(0, desc="Starting conversion")
-    
+def process(job_id, video, projection, mode):
+    global WORKER_STATUS
+
     with tempfile.TemporaryDirectory() as temp_dir:
         original_filename = os.path.basename(video.name)
         file_name, file_extension = os.path.splitext(original_filename)
+
+        file_name = str(job_id).zfill(4) + "_" + file_name
         
         temp_input_path = os.path.join(temp_dir, original_filename)
         shutil.copy(video.name, temp_input_path)
@@ -129,7 +134,6 @@ def process(video, projection, mode, progress=gr.Progress()):
         
         output_filename = f"{file_name}-fisheye.{file_extension}"
         output_path = os.path.join(temp_dir, output_filename)
-        # final_output_path = os.path.join(os.getcwd(), output_filename)
 
         if str(projection) == "eq":
             cmd = [
@@ -143,14 +147,12 @@ def process(video, projection, mode, progress=gr.Progress()):
                 output_path
             ]
             projection = "fisheye180"
-            if not ffmpeg(cmd, progress, total_frames, 0.0, 0.2):
-                return None, None, "Convertion 1 failed"
-            
+            if not ffmpeg(cmd, total_frames):
+                return (None, None)
         else:
             output_path = temp_input_path
 
-        progress(0.2, desc="Conversion 1 complete")
-
+        WORKER_STATUS = f"Load Models to create Masks"
 
         cap = cv2.VideoCapture(output_path)
 
@@ -191,7 +193,7 @@ def process(video, projection, mode, progress=gr.Progress()):
 
             if current_frame == 1:
                 init_mask_gen = GroundingDinoSAM2Segment()
-
+                
                 (imgLOut, imgLMask) = init_mask_gen.predict([cv2.cvtColor(imgL, cv2.COLOR_BGR2RGB)], 0.3)
                 (imgROut, imgRMask) = init_mask_gen.predict([cv2.cvtColor(imgR, cv2.COLOR_BGR2RGB)], 0.3)
 
@@ -219,15 +221,15 @@ def process(video, projection, mode, progress=gr.Progress()):
                 output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
                 
                 for i in range(WARMUP):
-                    progress(0.2 + (i / (total_frames + WARMUP)) * 0.6, desc=f"Warmup {i}/{WARMUP}")
+                    WORKER_STATUS = f"Warmup MatAnyone {i+1}/{WARMUP}"
                     output_prob_L = processor1.step(imgLV, first_frame_pred=True)
                     output_prob_R = processor2.step(imgRV, first_frame_pred=True)
             else:
                 output_prob_L = processor1.step(imgLV)
                 output_prob_R = processor2.step(imgRV)
 
-            print(f"Converting {current_frame}/{total_frames}")
-            progress(0.2 + ((current_frame + WARMUP) / (total_frames + WARMUP)) * 0.6, desc=f"Converting {current_frame}/{total_frames}")
+            WORKER_STATUS = f"Create Mask {current_frame}/{total_frames}"
+            print(WORKER_STATUS)
 
             mask_output_L = processor1.output_prob_to_mask(output_prob_L)
             mask_output_R = processor2.output_prob_to_mask(output_prob_R)
@@ -238,6 +240,8 @@ def process(video, projection, mode, progress=gr.Progress()):
             mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
             mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
 
+            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
+            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
 
             combined_image = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
             combined_image = cv2.resize(combined_image, (ow, oh))
@@ -267,7 +271,7 @@ def process(video, projection, mode, progress=gr.Progress()):
 
         print("FFmpeg Convert #2")
 
-        result_name = file_name + "_" + projection + "_alpha" + file_extension 
+        result_name = file_name.replace(' ', '_') + "_" + str(projection).upper() + "_alpha" + file_extension 
         cmd = [
             "ffmpeg",
             "-i", output_path,
@@ -285,23 +289,53 @@ def process(video, projection, mode, progress=gr.Progress()):
             "-y"
         ]
 
-        if not ffmpeg(cmd, progress, total_frames, 0.8, 1.0):
-            return None, None, "Convertion 2 failed"
+        if not ffmpeg(cmd, total_frames):
+            return (None, None)
+
+    WORKER_STATUS = f"Convertion completed" 
+    return (mask_video, result_name)
 
 
-        progress(1, desc="Conversion 2 complete")
+job_id = 0
+task_queue = queue.Queue()
+mask_list = []
+result_list = []
 
-    return mask_video, result_name, f"Conversion successful"
+def background_worker():
+    global file_list
+    global WORKER_STATUS
+    while True:
+        job = task_queue.get()
+        if job is None:
+            break
+        print("Start job", job['id'])
+        (mask, result) = process(job['id'], job['video'], job['projection'], job['mode'])
+        if mask is not None:
+            mask_list.append(mask)
+        if result is not None:
+            result_list.append(result)
+        task_queue.task_done()
+        time.sleep(5)
+        WORKER_STATUS = "Idle"
 
-def process_video(video, projection, mode):
-    mask_path, output_path, message = process(video, projection, mode)
-    print("completed", mask_path, output_path, message)
-    if mask_path and output_path:
-        return gr.File(value=mask_path, visible=True), gr.File(value=output_path, visible=True), message
-    else:
-        return gr.File(visible=False), gr.File(visible=False), message
+def add_job(video, projection, mode):
+    global job_id
+    if video is not None:
+        job_id += 1
+        print("Add job", job_id)
+        task_queue.put({
+            'id': job_id,
+            'video': video,
+            'projection': projection,
+            'mode': mode
+        })
+    return None
 
-# Create Gradio interface
+def status_text():
+    global task_queue
+    return "Worker Status: " + WORKER_STATUS + "\n" \
+        + f"Pending Jobs: {task_queue.qsize()}"
+
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
     with gr.Column():
@@ -309,21 +343,45 @@ with gr.Blocks() as demo:
         with gr.Row():
             projection_dropdown = gr.Dropdown(choices=["eq", "fisheye180", "fisheye190", "fisheye200"], label="VR Video Format", value="eq")
             mode_dropdown = gr.Dropdown(choices=["method-01"], label="Method", value="method-01")
-    with gr.Row():
-        mask_video = gr.File(label="Download Mask Video", visible=False)
-        output_video = gr.File(label="Download Converted Video", visible=False)
-    convert_button = gr.Button("Convert")
-    status = gr.Textbox(label="Status")
-    
-    convert_button.click(
-        fn=process_video,
+        
+    add_button = gr.Button("Add Job")
+    status = gr.Textbox(label="Status", lines=2)
+
+    mask_videos = gr.File(value=[], label="Download Mask Videos", visible=True)
+    output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
+
+    restart_button = gr.Button("Clear all jobs and data".upper())
+
+    add_button.click(
+        fn=add_job,
         inputs=[input_video, projection_dropdown, mode_dropdown],
-        outputs=[mask_video, output_video, status]
+        outputs=[input_video]
     )
 
+    restart_button.click(
+        # dirty hack, we use k8s restart pod
+        fn=lambda: os.system("pkill python"),
+        inputs=[],
+        outputs=[]
+    )
+
+    timer1 = gr.Timer(1, active=True)
+    timer5 = gr.Timer(5, active=True)
+    timer1.tick(status_text, outputs=status)
+    timer5.tick(lambda: result_list, outputs=output_videos)
+    timer5.tick(lambda: mask_list, outputs=mask_videos)
+    demo.load(fn=status_text, outputs=status)
+    demo.load(fn=lambda: mask_list, outputs=mask_videos)
+    demo.load(fn=lambda: result_list, outputs=output_videos)
+
+
 if __name__ == "__main__":
+    print("gradio version", gr.__version__)
     if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860)
+    
+    worker_thread = threading.Thread(target=background_worker, daemon=True)
+    worker_thread.start()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+    print("exit")

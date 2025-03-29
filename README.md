@@ -7,14 +7,10 @@ Convert your adult VR Videos into Passthrough AR Videos.
 
 Use the provided container and deploy on device with nvida gpu. Then use the buildin `grad.io` webui to convert your videos.
 
-Note: gradio is a bit buggy; the displayed process sometimes loses connection, but the conversion process continues in the background. The processed data is lost if you close the browser tab. I should look for a better solution here....
-
-A workaround for now (k8s) is to serve filebrowser with shared `/tmp` so we can download the processed files from there if grad.io fails. If you use docker you can mount a host directory to `/tmp` to be able o access the processed result files if gradio failes.
-
 ## Usage
 
 1. Create smal video chunks you want to convert to passthrough with no scene changes (i recommend chunks with length smaler than 3 minutes)
 2. Process these chuuks via the provided gradio webui
-3. Wait for complete of process. (Check the container logs if gradio failes)
+3. Wait for complete of process.
 4. Download the result
 5. Combine your chunks back into on video
