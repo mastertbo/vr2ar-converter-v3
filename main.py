@@ -166,6 +166,10 @@ def process(video, projection, mode, progress=gr.Progress()):
 
         objects = [1]
 
+        # TODO: when playing in Heresphere, the mask lags behind the video by approx. 1 frame. I still have to investigate where the problem lies. Possibly when merging the mask with the video or a bug in heresphere or the model simply always outputs a delayed mask, maybe it doesn't deal so well with the changes in movement. Workaround for now is to encode the mask of the next frame into the current frame.
+        INSERT_SHIFT = True
+
+        # adopted from published repo
         WARMUP = 10
         has_cuda = torch.torch.cuda.is_available()
 
@@ -241,9 +245,12 @@ def process(video, projection, mode, progress=gr.Progress()):
             
             _, binary = cv2.threshold(combined_image, 127, 255, cv2.THRESH_BINARY)
 
-            out.write(binary)
+            if INSERT_SHIFT and current_frame != 1:
+                out.write(binary)
             gc.collect()
 
+        if INSERT_SHIFT:
+            out.write(binary)
 
         cap.release()
         out.release()
