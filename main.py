@@ -365,7 +365,7 @@ with gr.Blocks() as demo:
         outputs=[]
     )
 
-    timer1 = gr.Timer(1, active=True)
+    timer1 = gr.Timer(2, active=True)
     timer5 = gr.Timer(5, active=True)
     timer1.tick(status_text, outputs=status)
     timer5.tick(lambda: result_list, outputs=output_videos)
