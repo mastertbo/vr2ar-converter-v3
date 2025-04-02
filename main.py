@@ -20,6 +20,7 @@ import threading
 import queue
 import random
 from sam2_executor import GroundingDinoSAM2Segment
+from PIL import Image
 
 import torch.nn.functional as F
 import numpy as np
@@ -27,9 +28,11 @@ import numpy as np
 from matanyone.model.matanyone import MatAnyone
 from matanyone.inference.inference_core import InferenceCore
 
+from data.ffmpegstream import FFmpegStream
+
 WORKER_STATUS = "Idle"
 
-def ffmpeg(cmd, total_frames):
+def exec_ffmpeg(cmd, total_frames):
     global WORKER_STATUS
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
             
@@ -66,14 +69,14 @@ def gen_erosion(alpha, min_kernel_size, max_kernel_size):
     erode = cv2.erode(fg, kernel, iterations=1)*255
     return erode.astype(np.float32)
 
-def fix_mask(img, mask):
+def fix_mask_old(img, mask):
     if mask.ndim == 2:
-        mask = mask.unsqueeze(0)  # Add channel dimension [1, H, W]
+        mask = mask.unsqueeze(0)
         if mask.ndim == 3:
             if mask.shape[0] == 1:
-                mask = mask[0]  # Remove batch dimension if present
-            elif mask.shape[2] == 1:  # If [H, W, 1]
-                mask = mask.permute(2, 0, 1)[0]  # Convert to [H, W]
+                mask = mask[0]
+            elif mask.shape[2] == 1:
+                mask = mask.permute(2, 0, 1)[0]
     
     # Convert mask to numpy for processing
     mask_np = (mask.cpu().numpy() * 255.0).astype(np.float32)
@@ -115,9 +118,23 @@ def prepare_frame(frame, has_cuda=True):
 
     return image_input
 
+def fix_mask2(mask):
+    mask = np.array(mask)
+    mask = gen_dilate(mask, 10, 10)
+    mask = gen_erosion(mask, 10, 10)
+    mask = torch.from_numpy(mask)
+    if torch.torch.cuda.is_available():
+        mask = mask.cuda()
+
+    return mask
+
+
 @torch.no_grad()
-def process(job_id, video, projection, mode):
+def process(job_id, video, projection, maskL, maskR):
     global WORKER_STATUS
+
+    maskL = fix_mask2(maskL)
+    maskR = fix_mask2(maskR)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         original_filename = os.path.basename(video.name)
@@ -147,7 +164,7 @@ def process(job_id, video, projection, mode):
                 output_path
             ]
             projection = "fisheye180"
-            if not ffmpeg(cmd, total_frames):
+            if not exec_ffmpeg(cmd, total_frames):
                 return (None, None)
         else:
             output_path = temp_input_path
@@ -175,14 +192,39 @@ def process(job_id, video, projection, mode):
         WARMUP = 10
         has_cuda = torch.torch.cuda.is_available()
 
-        while cap.isOpened():
-            ret, img = cap.read()
-            if not ret:
+        config = {
+            "video_filter": "scale=${width}:${height}",
+            "parameter": {
+                "width": 2048,
+                "height": 1024
+            }
+        }
+
+        ffmpeg = FFmpegStream(
+            video_path = output_path,
+            config = config,
+            skip_frames = 0
+        )
+
+        video_info = FFmpegStream.get_video_info(output_path)
+
+        matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
+        if torch.torch.cuda.is_available():
+            matanyone1 = matanyone1.cuda()
+        matanyone1 = matanyone1.eval()
+        processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
+
+        matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
+        if torch.torch.cuda.is_available():
+            matanyone2 = matanyone2.cuda()
+        matanyone2 = matanyone2.eval()
+        processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+
+        while ffmpeg.isOpen():
+            img = ffmpeg.read()
+            if img is None:
                 break
             current_frame += 1
-
-            oh, ow = img.shape[:2]
-            img = cv2.resize(img, (2048, 1024))
 
             _, width = img.shape[:2]
             imgL = img[:, :int(width/2)]
@@ -192,30 +234,8 @@ def process(job_id, video, projection, mode):
             imgRV = prepare_frame(imgR, has_cuda)
 
             if current_frame == 1:
-                init_mask_gen = GroundingDinoSAM2Segment()
-                
-                (imgLOut, imgLMask) = init_mask_gen.predict([cv2.cvtColor(imgL, cv2.COLOR_BGR2RGB)], 0.3)
-                (imgROut, imgRMask) = init_mask_gen.predict([cv2.cvtColor(imgR, cv2.COLOR_BGR2RGB)], 0.3)
-
-                del init_mask_gen
-                
-                if torch.torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-                if torch.torch.cuda.is_available():
-                    matanyone1 = matanyone1.cuda()
-                matanyone1 = matanyone1.eval()
-                processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
-
-                matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-                if torch.torch.cuda.is_available():
-                    matanyone2 = matanyone2.cuda()
-                matanyone2 = matanyone2.eval()
-                processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
-
-                imgLMask = fix_mask(imgLV, imgLMask[0])
-                imgRMask = fix_mask(imgRV, imgRMask[0])
+                imgLMask = maskL
+                imgRMask = maskR
 
                 output_prob_L = processor1.step(imgLV, imgLMask, objects=objects)
                 output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
@@ -244,7 +264,7 @@ def process(job_id, video, projection, mode):
             mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
 
             combined_image = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-            combined_image = cv2.resize(combined_image, (ow, oh))
+            combined_image = cv2.resize(combined_image, (video_info.width, video_info.height))
 
             
             _, binary = cv2.threshold(combined_image, 127, 255, cv2.THRESH_BINARY)
@@ -256,7 +276,7 @@ def process(job_id, video, projection, mode):
         if INSERT_SHIFT:
             out.write(binary)
 
-        cap.release()
+        ffmpeg.stop()
         out.release()
 
         del processor1
@@ -289,7 +309,7 @@ def process(job_id, video, projection, mode):
             "-y"
         ]
 
-        if not ffmpeg(cmd, total_frames):
+        if not exec_ffmpeg(cmd, total_frames):
             return (None, None)
 
     WORKER_STATUS = f"Convertion completed" 
@@ -309,7 +329,7 @@ def background_worker():
         if job is None:
             break
         print("Start job", job['id'])
-        (mask, result) = process(job['id'], job['video'], job['projection'], job['mode'])
+        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'])
         if mask is not None:
             mask_list.append(mask)
         if result is not None:
@@ -318,33 +338,148 @@ def background_worker():
         time.sleep(5)
         WORKER_STATUS = "Idle"
 
-def add_job(video, projection, mode):
+def add_job(video, projection, maskL, maskR):
     global job_id
-    if video is not None:
+    if video is not None and maskL is not None and maskR is not None:
         job_id += 1
         print("Add job", job_id)
         task_queue.put({
             'id': job_id,
             'video': video,
             'projection': projection,
-            'mode': mode
+            'maskL': Image.fromarray(maskL).convert('L'),
+            'maskR': Image.fromarray(maskR).convert('L')
         })
-    return None
+    return None, None, None, None, None
 
 def status_text():
     global task_queue
     return "Worker Status: " + WORKER_STATUS + "\n" \
         + f"Pending Jobs: {task_queue.qsize()}"
 
+
+def get_mask(video, projection, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold):
+    frame = FFmpegStream.get_frame(video.name, 0)
+    if str(projection) == "eq":
+        configL = {
+            "video_filter": "crop=iw/2:ih:0:0,v360=input=he:output=fisheye:v_fov=${fov}:h_fov=${fov}:w=${width}:h=${height}",
+            "parameter": {
+                "width": 1024,
+                "height": 1024,
+                "fov": 180
+            }
+        }
+        configR = {
+            "video_filter": "crop=iw/2:ih:iw/2:0,v360=input=he:output=fisheye:v_fov=${fov}:h_fov=${fov}:w=${width}:h=${height}",
+            "parameter": {
+                "width": 1024,
+                "height": 1024,
+                "fov": 180
+            }
+        }
+
+        frameL = FFmpegStream.get_projection(frame, configL)
+        frameR = FFmpegStream.get_projection(frame, configR)
+    else:
+        # TODO specify size global
+        width = 2048
+        frame = cv2.resize(frame, (int(width), int(width/2)))
+        frameL = frame[:, :int(width/2)]
+        frameR = frame[:, int(width/2):]
+   
+    frameL = cv2.cvtColor(frameL, cv2.COLOR_BGR2RGB)
+    frameR = cv2.cvtColor(frameR, cv2.COLOR_BGR2RGB)
+
+    sam2 = GroundingDinoSAM2Segment()
+    (_, imgLMask) = sam2.predict([frameL], maskLThreshold, maskLPrompt)
+    (_, imgRMask) = sam2.predict([frameR], maskRThreshold, maskRPrompt)
+
+    del sam2
+    
+    maskL = Image.fromarray((imgLMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
+    maskR = Image.fromarray((imgRMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
+
+    if False:
+        red_transparent = Image.new("RGB", maskL.size, "red")
+        red_transparent = red_transparent.convert("RGBA")
+        red_transparent.putalpha(128)
+
+        previewL = Image.composite(
+            Image.fromarray(frameL).convert("RGBA"),
+            red_transparent, 
+            maskL
+        )
+        previewR = Image.composite(
+            Image.fromarray(frameR).convert("RGBA"),
+            red_transparent,
+            maskR
+        )
+
+    previewL = Image.composite(
+        Image.new("RGB", maskL.size, "blue"),
+        Image.fromarray(frameL).convert("RGBA"),
+        maskL.point(lambda p: 100 if p > 1 else 0)
+    )
+    previewR = Image.composite(
+        Image.new("RGB", maskR.size, "blue"),
+        Image.fromarray(frameR).convert("RGBA"),
+        maskR.point(lambda p: 100 if p > 1 else 0)
+    )
+
+
+
+    return previewL, maskL, previewR, maskR
+
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
+    gr.Markdown('''
+        Process:
+        1. Upload Your video
+        2. Select Video Source Format
+        3. Generate Initial Mask with Button
+        4. Add Video Mask Job
+
+        Notes: This tool require min 12GB VRAM to run proberly. If you want to generate Inital masks for the next job while a background video mask job is runnung you need 24GB VRAM.
+    ''')
     with gr.Column():
         input_video = gr.File(label="Upload Video (MKV or MP4)", file_types=["mkv", "mp4", "video"])
-        with gr.Row():
-            projection_dropdown = gr.Dropdown(choices=["eq", "fisheye180", "fisheye190", "fisheye200"], label="VR Video Format", value="eq")
-            mode_dropdown = gr.Dropdown(choices=["method-01"], label="Method", value="method-01")
-        
-    add_button = gr.Button("Add Job")
+        projection_dropdown = gr.Dropdown(choices=["eq", "fisheye180", "fisheye190", "fisheye200"], label="VR Video Source Format", value="eq")
+    
+
+    mask_button = gr.Button("1. Generate Initial Mask")
+    with gr.Row():
+        with gr.Column():
+            maskLPrompt = gr.Textbox(label="Left Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+            maskLThreshold = gr.Number(
+                label="Threshold",
+                minimum=0.01,
+                maximum=0.99,
+                step=0.01,
+                value=0.3
+            )
+        with gr.Column():
+            maskRPrompt = gr.Textbox(label="Right Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+            maskRThreshold = gr.Number(
+                label="Threshold",
+                minimum=0.01,
+                maximum=0.99,
+                step=0.01,
+                value=0.3
+            )
+    with gr.Row():
+        previewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+        previewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+    with gr.Row():
+        maskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+        maskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+
+    mask_button.click(
+        fn=get_mask,
+        inputs=[input_video, projection_dropdown, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold],
+        outputs=[previewL, maskL, previewR, maskR]
+    )
+
+    add_button = gr.Button("2. Add Job")
     status = gr.Textbox(label="Status", lines=2)
 
     mask_videos = gr.File(value=[], label="Download Mask Videos", visible=True)
@@ -354,8 +489,8 @@ with gr.Blocks() as demo:
 
     add_button.click(
         fn=add_job,
-        inputs=[input_video, projection_dropdown, mode_dropdown],
-        outputs=[input_video]
+        inputs=[input_video, projection_dropdown, maskL, maskR],
+        outputs=[input_video, previewL, maskL, previewR, maskR]
     )
 
     restart_button.click(
