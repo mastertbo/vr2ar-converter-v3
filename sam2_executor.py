@@ -1,4 +1,5 @@
 import os
+import gc
 import sys
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -245,6 +246,47 @@ def sam_segment(sam_model, image, boxes):
     masks = np.transpose(masks, (1, 0, 2, 3))
     return create_tensor_output(image_np, masks, boxes)
 
+def sam_segment_points(sam_model, image, prompt_points):
+    predictor = SAM2ImagePredictor(sam_model)
+    image_np = np.array(image)
+    image_np_rgb = image_np[..., :3]
+    predictor.set_image(image_np_rgb)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if len(prompt_points) != 0:
+        points_value = [p for p, _ in prompt_points]
+        points = torch.Tensor(points_value).to(device).unsqueeze(1)
+        lables_value = [int(l) for _, l in prompt_points]
+        labels = torch.Tensor(lables_value).to(device).unsqueeze(1)
+        transformed_points = points
+    else:
+        transformed_points, labels = None, None
+
+    input_points = np.array([(p[0][0], p[0][1]) for p in prompt_points])
+    input_labels = np.array([p[1] for p in prompt_points])
+    
+    masks, scores, _ = predictor.predict(
+        point_coords=input_points, point_labels=input_labels, box=None, multimask_output=False
+    )
+    
+    mask = masks[0]    
+    mask_all = np.ones((image_np_rgb .shape[0], image_np_rgb .shape[1], 3))
+    # color_mask = np.random.random((1, 3)).tolist()[0]
+    for i in range(3):
+        mask_all[mask == True, i] = 1
+        mask_all[mask == False, i] = 0.3
+    img = image_np_rgb * mask_all / 255
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    mask_all = np.zeros((image_np_rgb.shape[0], image_np_rgb.shape[1]))
+    mask_all[mask == True] = 1
+    masked_image = np.zeros((image_np_rgb.shape[0], image_np_rgb.shape[1], 4))
+    masked_image[:,:,0:3] = image_np_rgb  / 255
+    masked_image[:,:,3] = mask_all
+
+    return img, masks[0]
+
 
 class GroundingDinoSAM2Segment:
     def __init__(self):
@@ -273,4 +315,14 @@ class GroundingDinoSAM2Segment:
             return (empty_mask, empty_mask)
         return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0)) # Image, Mask
 
+
+class SAM2PointSegment:
+    def __init__(self):
+        self.sam_model = load_sam_model("sam2_1_hiera_large.pt")
+
+    def predict(self, image, prompt_points):
+        item = Image.fromarray(
+            image
+        ).convert("RGBA")
+        return sam_segment_points(self.sam_model, item, prompt_points)
 

@@ -19,7 +19,7 @@ import time
 import threading
 import queue
 import random
-from sam2_executor import GroundingDinoSAM2Segment
+from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
 
 import torch.nn.functional as F
@@ -29,6 +29,7 @@ from matanyone.model.matanyone import MatAnyone
 from matanyone.inference.inference_core import InferenceCore
 
 from data.ffmpegstream import FFmpegStream
+from video_process import ImageFrame
 
 WORKER_STATUS = "Idle"
 
@@ -130,7 +131,7 @@ def fix_mask2(mask):
 
 
 @torch.no_grad()
-def process(job_id, video, projection, maskL, maskR):
+def process(job_id, video, projection, maskL, maskR, crf = 16):
     global WORKER_STATUS
 
     maskL = fix_mask2(maskL)
@@ -160,7 +161,7 @@ def process(job_id, video, projection, maskL, maskR):
                 "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]",
                 "-map", "[v]",
                 "-c:a", "copy",
-                "-crf", "16",
+                "-crf", str(crf),
                 output_path
             ]
             projection = "fisheye180"
@@ -301,7 +302,7 @@ def process(job_id, video, projection, maskL, maskR):
             "-filter_complex",
             "[1]scale=iw*0.4:-1[alpha];[2][alpha]scale2ref[mask][alpha];[alpha][mask]alphamerge,split=2[masked_alpha1][masked_alpha2]; [masked_alpha1]crop=iw/2:ih:0:0,split=2[masked_alpha_l1][masked_alpha_l2]; [masked_alpha2]crop=iw/2:ih:iw/2:0,split=4[masked_alpha_r1][masked_alpha_r2][masked_alpha_r3][masked_alpha_r4]; [0][masked_alpha_l1]overlay=W*0.5-w*0.5:-0.5*h[out_lt];[out_lt][masked_alpha_l2]overlay=W*0.5-w*0.5:H-0.5*h[out_tb]; [out_tb][masked_alpha_r1]overlay=0-w*0.5:-0.5*h[out_l_lt];[out_l_lt][masked_alpha_r2]overlay=0-w*0.5:H-0.5*h[out_tb_ltb]; [out_tb_ltb][masked_alpha_r3]overlay=W-w*0.5:-0.5*h[out_r_lt];[out_r_lt][masked_alpha_r4]overlay=W-w*0.5:H-0.5*h",
             "-c:v", "libx265", 
-            "-crf", "16",
+            "-crf", str(crf),
             "-preset", "veryfast",
             "-map", "3:a:?",
             "-c:a", "copy",
@@ -329,7 +330,7 @@ def background_worker():
         if job is None:
             break
         print("Start job", job['id'])
-        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'])
+        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'])
         if mask is not None:
             mask_list.append(mask)
         if result is not None:
@@ -338,7 +339,7 @@ def background_worker():
         time.sleep(5)
         WORKER_STATUS = "Idle"
 
-def add_job(video, projection, maskL, maskR):
+def add_job(video, projection, maskL, maskR, crf):
     global job_id
     if video is not None and maskL is not None and maskR is not None:
         job_id += 1
@@ -347,18 +348,45 @@ def add_job(video, projection, maskL, maskR):
             'id': job_id,
             'video': video,
             'projection': projection,
+            'crf': crf,
             'maskL': Image.fromarray(maskL).convert('L'),
             'maskR': Image.fromarray(maskR).convert('L')
         })
-    return None, None, None, None, None
+    return None, None, None, None, None, None, None
 
 def status_text():
     global task_queue
     return "Worker Status: " + WORKER_STATUS + "\n" \
         + f"Pending Jobs: {task_queue.qsize()}"
 
+current_origin_frame = {
+    "L": None,
+    "R": None
+}
 
-def get_mask(video, projection, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold):
+colors = [(255, 0, 0), (0, 255, 0)]
+markers = [1, 5]
+
+def add_mark(frame):
+    if frame is None:
+        return None
+    result = frame.frame_data.copy()
+    marker_size = 25
+    marker_thickness = 3
+    marker_default_width = 1200
+    width = result.shape[0]
+    ratio = width / marker_default_width
+    marker_final_size = int(marker_size * ratio)
+    if marker_final_size < 3:
+        marker_final_size = 3
+    marker_final_thickness = int(marker_thickness * ratio)
+    if marker_final_thickness < 2:
+        marker_final_thickness = 2
+    for (x, y, label) in frame.point_set:
+        cv2.drawMarker(result, (x, y), colors[label], markerType=markers[label], markerSize=marker_final_size, thickness=marker_final_thickness)
+    return result
+
+def get_frame(video, projection):
     frame = FFmpegStream.get_frame(video.name, 0)
     if str(projection) == "eq":
         configL = {
@@ -386,34 +414,26 @@ def get_mask(video, projection, maskLPrompt, maskRPrompt, maskLThreshold, maskRT
         frame = cv2.resize(frame, (int(width), int(width/2)))
         frameL = frame[:, :int(width/2)]
         frameR = frame[:, int(width/2):]
-   
+
     frameL = cv2.cvtColor(frameL, cv2.COLOR_BGR2RGB)
     frameR = cv2.cvtColor(frameR, cv2.COLOR_BGR2RGB)
+
+    current_origin_frame['L'] = ImageFrame(frameL, 0)
+    current_origin_frame['R'] = ImageFrame(frameR, 0)
+
+    return Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(frameL), Image.fromarray(frameR)
+
+def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold):
+    if frameL is None or frameR is None:
+        return None, None, None, None
 
     sam2 = GroundingDinoSAM2Segment()
     (_, imgLMask) = sam2.predict([frameL], maskLThreshold, maskLPrompt)
     (_, imgRMask) = sam2.predict([frameR], maskRThreshold, maskRPrompt)
-
     del sam2
     
     maskL = Image.fromarray((imgLMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
     maskR = Image.fromarray((imgRMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
-
-    if False:
-        red_transparent = Image.new("RGB", maskL.size, "red")
-        red_transparent = red_transparent.convert("RGBA")
-        red_transparent.putalpha(128)
-
-        previewL = Image.composite(
-            Image.fromarray(frameL).convert("RGBA"),
-            red_transparent, 
-            maskL
-        )
-        previewR = Image.composite(
-            Image.fromarray(frameR).convert("RGBA"),
-            red_transparent,
-            maskR
-        )
 
     previewL = Image.composite(
         Image.new("RGB", maskL.size, "blue"),
@@ -426,7 +446,46 @@ def get_mask(video, projection, maskLPrompt, maskRPrompt, maskLThreshold, maskRT
         maskR.point(lambda p: 100 if p > 1 else 0)
     )
 
+    return previewL, maskL, previewR, maskR
 
+def get_mask2():
+    global current_origin_frame
+
+    if current_origin_frame['L'] is None or current_origin_frame['R'] is None:
+        return None, None, None, None
+
+    frameL = current_origin_frame['L'].frame_data
+    frameR = current_origin_frame['R'].frame_data
+
+    pointsL = []
+    for x, y, label in current_origin_frame['L'].point_set:
+        pointsL.append(((x, y), label))
+
+    pointsR = []
+    for x, y, label in current_origin_frame['R'].point_set:
+        pointsR.append(((x, y), label))
+
+    if len(pointsR) == 0 or len(pointsL) == 0:
+        return None, None, None, None
+
+    sam2 = SAM2PointSegment()
+    (_, imgLMask) = sam2.predict(frameL, pointsL)
+    (_, imgRMask) = sam2.predict(frameR, pointsR)
+    del sam2
+    
+    maskL = Image.fromarray((imgLMask * 255).astype(np.uint8), mode='L')
+    maskR = Image.fromarray((imgRMask * 255).astype(np.uint8), mode='L')
+
+    previewL = Image.composite(
+        Image.new("RGB", maskL.size, "blue"),
+        Image.fromarray(frameL).convert("RGBA"),
+        maskL.point(lambda p: 100 if p > 1 else 0)
+    )
+    previewR = Image.composite(
+        Image.new("RGB", maskR.size, "blue"),
+        Image.fromarray(frameR).convert("RGBA"),
+        maskR.point(lambda p: 100 if p > 1 else 0)
+    )
 
     return previewL, maskL, previewR, maskR
 
@@ -436,69 +495,176 @@ with gr.Blocks() as demo:
         Process:
         1. Upload Your video
         2. Select Video Source Format
-        3. Generate Initial Mask with Button
-        4. Add Video Mask Job
+        3. Extract first projection Frame
+        4. Generate Initial Mask with Button
+        5. Add Video Mask Job
 
         Notes: This tool require min 12GB VRAM to run proberly. If you want to generate Inital masks for the next job while a background video mask job is runnung you need 24GB VRAM.
     ''')
     with gr.Column():
+        gr.Markdown("## Stage 1 - Video")
         input_video = gr.File(label="Upload Video (MKV or MP4)", file_types=["mkv", "mp4", "video"])
         projection_dropdown = gr.Dropdown(choices=["eq", "fisheye180", "fisheye190", "fisheye200"], label="VR Video Source Format", value="eq")
     
 
-    mask_button = gr.Button("1. Generate Initial Mask")
-    with gr.Row():
-        with gr.Column():
-            maskLPrompt = gr.Textbox(label="Left Eye Mask Prompt", value="top person", lines=1, max_lines=1)
-            maskLThreshold = gr.Number(
-                label="Threshold",
-                minimum=0.01,
-                maximum=0.99,
-                step=0.01,
-                value=0.3
-            )
-        with gr.Column():
-            maskRPrompt = gr.Textbox(label="Right Eye Mask Prompt", value="top person", lines=1, max_lines=1)
-            maskRThreshold = gr.Number(
-                label="Threshold",
-                minimum=0.01,
-                maximum=0.99,
-                step=0.01,
-                value=0.3
-            )
-    with gr.Row():
-        previewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
-        previewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
-    with gr.Row():
-        maskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
-        maskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+    with gr.Column():
+        gr.Markdown("## Stage 2 - Extract First Frame")
+        frame_button = gr.Button("Extract Projection Frame")
+        gr.Markdown("### Result")
+        with gr.Row():
+            framePreviewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            framePreviewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
 
-    mask_button.click(
-        fn=get_mask,
-        inputs=[input_video, projection_dropdown, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold],
-        outputs=[previewL, maskL, previewR, maskR]
-    )
+    gr.Markdown("## Stage 3 - Generate Initial Mask")
+    with gr.Tabs():
+        with gr.Tab("Prompt"):
+            with gr.Column():
+                with gr.Row():
+                    with gr.Column():
+                        maskLPrompt = gr.Textbox(label="Left Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+                        maskLThreshold = gr.Number(
+                            label="Threshold",
+                            minimum=0.01,
+                            maximum=0.99,
+                            step=0.01,
+                            value=0.3
+                        )
+                    with gr.Column():
+                        maskRPrompt = gr.Textbox(label="Right Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+                        maskRThreshold = gr.Number(
+                            label="Threshold",
+                            minimum=0.01,
+                            maximum=0.99,
+                            step=0.01,
+                            value=0.3
+                        )
+                mask_button = gr.Button("Generate Initial Mask")
+        with gr.Tab("Points"):
+            with gr.Row():
+                with gr.Column():
+                    with gr.Row():
+                        undoL = gr.Button('Undo')
+                        removeL = gr.Button('Clear')
+                    with gr.Column():
+                        maskSelectionL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+                        groupL = gr.Radio(['foreground', 'background'], label='Object Type', value='foreground')
+                with gr.Column():
+                    with gr.Row():
+                        undoR = gr.Button('Undo')
+                        removeR = gr.Button('Clear')
+                    with gr.Column():
+                        maskSelectionR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+                        groupR = gr.Radio(['foreground', 'background'], label='Object Type', value='foreground')
 
-    add_button = gr.Button("2. Add Job")
-    status = gr.Textbox(label="Status", lines=2)
+            def add_mark_point(t, point_type, event: gr.SelectData):
+                global current_origin_frame
+                label = 1
+                if point_type == 'foreground':
+                    label = 1
+                elif point_type == 'background':
+                    label = 0
+                
+                if current_origin_frame[t] is None:
+                    return None
+                
+                current_origin_frame[t].add(*event.index, label)
+                return add_mark(current_origin_frame[t])
 
-    mask_videos = gr.File(value=[], label="Download Mask Videos", visible=True)
-    output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
+            def add_mark_point_l(point_type, event: gr.SelectData):
+                return add_mark_point('L', point_type, event)
+            
+            def add_mark_point_r(point_type, event: gr.SelectData):
+                return add_mark_point('R', point_type, event)
+            
+            def undo_last_point_l():
+                global current_origin_frame
+                if current_origin_frame['L'] is None:
+                    return None
+                current_origin_frame['L'].pop()
+                return add_mark(current_origin_frame['L'])
 
-    restart_button = gr.Button("Clear all jobs and data".upper())
+            def undo_last_point_r():
+                global current_origin_frame
+                if current_origin_frame['R'] is None:
+                    return None
+                current_origin_frame['R'].pop()
+                return add_mark(current_origin_frame['R'])
 
-    add_button.click(
-        fn=add_job,
-        inputs=[input_video, projection_dropdown, maskL, maskR],
-        outputs=[input_video, previewL, maskL, previewR, maskR]
-    )
+            def remove_all_points_l():
+                global current_origin_frame
+                if current_origin_frame['L'] is None:
+                    return None
+                current_origin_frame['L'].clear()
+                return current_origin_frame['L'].frame_data
+            
+            def remove_all_points_r():
+                global current_origin_frame
+                if current_origin_frame['R'] is None:
+                    return None
+                current_origin_frame['R'].clear()
+                return current_origin_frame['R'].frame_data
 
-    restart_button.click(
-        # dirty hack, we use k8s restart pod
-        fn=lambda: os.system("pkill python"),
-        inputs=[],
-        outputs=[]
-    )
+            gr.Image.select(maskSelectionL, add_mark_point_l, inputs = [groupL], outputs = [maskSelectionL])
+            gr.Image.select(maskSelectionR, add_mark_point_r, inputs = [groupR], outputs = [maskSelectionR])
+
+            gr.Button.click(undoL, undo_last_point_l, inputs=None, outputs=maskSelectionL)
+            gr.Button.click(undoR, undo_last_point_r, inputs=None, outputs=maskSelectionR)
+            gr.Button.click(removeL, remove_all_points_l, inputs=None, outputs=maskSelectionL)
+            gr.Button.click(removeR, remove_all_points_r, inputs=None, outputs=maskSelectionR)
+            mask2_button = gr.Button("Generate Initial Mask")
+
+
+
+
+    with gr.Column():
+        gr.Markdown("### Result")
+        with gr.Row():
+            maskPreviewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            maskPreviewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+        with gr.Row():
+            maskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            maskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+
+        frame_button.click(
+            fn=get_frame,
+            inputs=[input_video, projection_dropdown],
+            outputs=[framePreviewL, framePreviewR, maskSelectionL, maskSelectionR]
+        )
+
+        mask_button.click(
+            fn=get_mask,
+            inputs=[framePreviewL, framePreviewR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold],
+            outputs=[maskPreviewL, maskL, maskPreviewR, maskR]
+        )
+
+        mask2_button.click(
+            fn=get_mask2,
+            inputs=None,
+            outputs=[maskPreviewL, maskL, maskPreviewR, maskR]
+        )
+
+    with gr.Column():
+        gr.Markdown("## Stage 4 - Add Job")
+        crf_dropdown = gr.Dropdown(choices=[16,17,18,19,20,21,22], label="Encode CRF", value=16)
+        add_button = gr.Button("Add Job")
+        add_button.click(
+            fn=add_job,
+            inputs=[input_video, projection_dropdown, maskL, maskR, crf_dropdown],
+            outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR]
+        )
+
+    with gr.Column():
+        gr.Markdown("## Job Results")
+        status = gr.Textbox(label="Status", lines=2)
+        mask_videos = gr.File(value=[], label="Download Mask Videos", visible=True)
+        output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
+        restart_button = gr.Button("Clear all jobs and data".upper())
+        restart_button.click(
+            # dirty hack, we use k8s restart pod
+            fn=lambda: os.system("pkill python"),
+            inputs=[],
+            outputs=[]
+        )
 
     timer1 = gr.Timer(2, active=True)
     timer5 = gr.Timer(5, active=True)
