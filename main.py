@@ -352,7 +352,7 @@ def add_job(video, projection, maskL, maskR, crf):
             'maskL': Image.fromarray(maskL).convert('L'),
             'maskR': Image.fromarray(maskR).convert('L')
         })
-    return None, None, None, None, None, None, None
+    return None, None, None, None, None, None, None, None, None
 
 def status_text():
     global task_queue
@@ -421,31 +421,55 @@ def get_frame(video, projection):
     current_origin_frame['L'] = ImageFrame(frameL, 0)
     current_origin_frame['R'] = ImageFrame(frameR, 0)
 
-    return Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(frameL), Image.fromarray(frameR)
+    return Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L"), Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L")
 
-def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold):
+def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold, maskLNegativePrompt, maskRNegativePrompt):
     if frameL is None or frameR is None:
         return None, None, None, None
 
     sam2 = GroundingDinoSAM2Segment()
-    (_, imgLMask) = sam2.predict([frameL], maskLThreshold, maskLPrompt)
-    (_, imgRMask) = sam2.predict([frameR], maskRThreshold, maskRPrompt)
+
+    if len( maskLPrompt) > 0: 
+        (_, imgLMask) = sam2.predict([frameL], maskLThreshold, maskLPrompt)
+        maskL = (imgLMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8)
+        if len( maskLNegativePrompt) > 0: 
+            (_, negativeImgLMask) = sam2.predict([frameL], maskLThreshold, maskLNegativePrompt)
+            invNegativeMaskL = 255 - (negativeImgLMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8)
+            maskL = np.bitwise_and(maskL, invNegativeMaskL)
+
+        maskL = Image.fromarray(maskL, mode='L')
+
+        previewL = Image.composite(
+            Image.new("RGB", maskL.size, "blue"),
+            Image.fromarray(frameL).convert("RGBA"),
+            maskL.point(lambda p: 100 if p > 1 else 0)
+        )
+    else:
+        previewL = frameL
+        maskL = Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L")
+
+    if len( maskRPrompt) > 0: 
+        (_, imgRMask) = sam2.predict([frameR], maskRThreshold, maskRPrompt)
+
+        maskR = (imgRMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8)
+
+        if len( maskRNegativePrompt) > 0: 
+            (_, negativeImgRMask) = sam2.predict([frameR], maskRThreshold, maskRNegativePrompt)
+            invNegativeMaskR = 255 - (negativeImgRMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8)
+            maskR = np.bitwise_and(maskR, invNegativeMaskR)
+
+        maskR = Image.fromarray(maskR, mode='L')
+        previewR = Image.composite(
+                Image.new("RGB", maskR.size, "blue"),
+                Image.fromarray(frameR).convert("RGBA"),
+                maskR.point(lambda p: 100 if p > 1 else 0)
+            )
+    else:
+        previewR = frameR
+        maskR = Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L")
+
     del sam2
     
-    maskL = Image.fromarray((imgLMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
-    maskR = Image.fromarray((imgRMask[0].squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
-
-    previewL = Image.composite(
-        Image.new("RGB", maskL.size, "blue"),
-        Image.fromarray(frameL).convert("RGBA"),
-        maskL.point(lambda p: 100 if p > 1 else 0)
-    )
-    previewR = Image.composite(
-        Image.new("RGB", maskR.size, "blue"),
-        Image.fromarray(frameR).convert("RGBA"),
-        maskR.point(lambda p: 100 if p > 1 else 0)
-    )
-
     return previewL, maskL, previewR, maskR
 
 def get_mask2():
@@ -465,29 +489,58 @@ def get_mask2():
     for x, y, label in current_origin_frame['R'].point_set:
         pointsR.append(((x, y), label))
 
-    if len(pointsR) == 0 or len(pointsL) == 0:
-        return None, None, None, None
-
     sam2 = SAM2PointSegment()
-    (_, imgLMask) = sam2.predict(frameL, pointsL)
-    (_, imgRMask) = sam2.predict(frameR, pointsR)
-    del sam2
-    
-    maskL = Image.fromarray((imgLMask * 255).astype(np.uint8), mode='L')
-    maskR = Image.fromarray((imgRMask * 255).astype(np.uint8), mode='L')
 
-    previewL = Image.composite(
-        Image.new("RGB", maskL.size, "blue"),
-        Image.fromarray(frameL).convert("RGBA"),
-        maskL.point(lambda p: 100 if p > 1 else 0)
-    )
-    previewR = Image.composite(
-        Image.new("RGB", maskR.size, "blue"),
-        Image.fromarray(frameR).convert("RGBA"),
-        maskR.point(lambda p: 100 if p > 1 else 0)
-    )
+    if len(pointsL) != 0:
+        (_, imgLMask) = sam2.predict(frameL, pointsL)
+        maskL = Image.fromarray((imgLMask * 255).astype(np.uint8), mode='L')
+        previewL = Image.composite(
+            Image.new("RGB", maskL.size, "blue"),
+            Image.fromarray(frameL).convert("RGBA"),
+            maskL.point(lambda p: 100 if p > 1 else 0)
+        )
+    else:
+        previewL = frameL
+        maskL = Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L") 
+
+
+    if len(pointsR) != 0:
+        (_, imgRMask) = sam2.predict(frameR, pointsR)
+    
+        maskR = Image.fromarray((imgRMask * 255).astype(np.uint8), mode='L')
+
+        previewR = Image.composite(
+            Image.new("RGB", maskR.size, "blue"),
+            Image.fromarray(frameR).convert("RGBA"),
+            maskR.point(lambda p: 100 if p > 1 else 0)
+        )
+    else:
+        previewR = frameR
+        maskR = Image.fromarray(np.zeros([1024, 1024, 3], dtype=np.uint8)).convert("L") 
+
+    del sam2
 
     return previewL, maskL, previewR, maskR
+
+def merge_add_mask(maskL, maskR, mergedMaskL, mergedMaskR):
+    if maskL is not None and mergedMaskL is not None:
+        mergedMaskL = np.bitwise_or(np.array(mergedMaskL), np.array(maskL))
+        mergedMaskL = Image.fromarray(mergedMaskL).convert("L")
+    if maskR is not None and mergedMaskR is not None:
+        mergedMaskR = np.bitwise_or(np.array(mergedMaskR), np.array(maskR))
+        mergedMaskR = Image.fromarray(mergedMaskR).convert("L")
+    return  mergedMaskL, mergedMaskR
+
+def merge_subtract_mask(maskL, maskR, mergedMaskL, mergedMaskR):
+    if maskL is not None and mergedMaskL is not None:
+        invMaskL = 255 - np.array(maskL)
+        mergedMaskL = np.bitwise_and(np.array(mergedMaskL), invMaskL)
+        mergedMaskL = Image.fromarray(mergedMaskL).convert("L")
+    if maskR is not None and mergedMaskR is not None:
+        invMaskR = 255 - np.array(maskR)
+        mergedMaskR = np.bitwise_and(np.array(mergedMaskR), invMaskR)
+        mergedMaskR = Image.fromarray(mergedMaskR).convert("L")
+    return  mergedMaskL, mergedMaskR
 
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
@@ -521,7 +574,8 @@ with gr.Blocks() as demo:
             with gr.Column():
                 with gr.Row():
                     with gr.Column():
-                        maskLPrompt = gr.Textbox(label="Left Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+                        maskLPrompt = gr.Textbox(label="Positive Prompt", value="top person", lines=1, max_lines=1)
+                        maskLNegativePrompt = gr.Textbox(label="Negative Prompt", value="", lines=1, max_lines=1)
                         maskLThreshold = gr.Number(
                             label="Threshold",
                             minimum=0.01,
@@ -530,7 +584,8 @@ with gr.Blocks() as demo:
                             value=0.3
                         )
                     with gr.Column():
-                        maskRPrompt = gr.Textbox(label="Right Eye Mask Prompt", value="top person", lines=1, max_lines=1)
+                        maskRPrompt = gr.Textbox(label="Positive Prompt", value="top person", lines=1, max_lines=1)
+                        maskRNegativePrompt = gr.Textbox(label="Negative Prompt", value="", lines=1, max_lines=1)
                         maskRThreshold = gr.Number(
                             label="Threshold",
                             minimum=0.01,
@@ -538,7 +593,7 @@ with gr.Blocks() as demo:
                             step=0.01,
                             value=0.3
                         )
-                mask_button = gr.Button("Generate Initial Mask")
+                mask_button = gr.Button("Generate Mask")
         with gr.Tab("Points"):
             with gr.Row():
                 with gr.Column():
@@ -611,29 +666,38 @@ with gr.Blocks() as demo:
             gr.Button.click(undoR, undo_last_point_r, inputs=None, outputs=maskSelectionR)
             gr.Button.click(removeL, remove_all_points_l, inputs=None, outputs=maskSelectionL)
             gr.Button.click(removeR, remove_all_points_r, inputs=None, outputs=maskSelectionR)
-            mask2_button = gr.Button("Generate Initial Mask")
+            mask2_button = gr.Button("Generate Mask")
 
 
 
 
     with gr.Column():
-        gr.Markdown("### Result")
+        gr.Markdown("### Mask Step 1")
         with gr.Row():
             maskPreviewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
             maskPreviewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
         with gr.Row():
             maskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
             maskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+    with gr.Column():
+        gr.Markdown("### Mask Step 2")
+        gr.Markdown("Add or subtract mask from mask step 1 to the frame initial Mask")
+        with gr.Row():
+            mask_add_button = gr.Button("Add Mask")
+            mask_subtract_button = gr.Button("Subtract Mask")
+        with gr.Row():
+            mergedMaskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            mergedMaskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
 
         frame_button.click(
             fn=get_frame,
             inputs=[input_video, projection_dropdown],
-            outputs=[framePreviewL, framePreviewR, maskSelectionL, maskSelectionR]
+            outputs=[framePreviewL, framePreviewR, maskSelectionL, maskSelectionR, mergedMaskL, mergedMaskR]
         )
 
         mask_button.click(
             fn=get_mask,
-            inputs=[framePreviewL, framePreviewR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold],
+            inputs=[framePreviewL, framePreviewR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold, maskLNegativePrompt, maskRNegativePrompt],
             outputs=[maskPreviewL, maskL, maskPreviewR, maskR]
         )
 
@@ -643,14 +707,26 @@ with gr.Blocks() as demo:
             outputs=[maskPreviewL, maskL, maskPreviewR, maskR]
         )
 
+        mask_add_button.click(
+            fn=merge_add_mask,
+            inputs=[maskL, maskR, mergedMaskL, mergedMaskR],
+            outputs=[mergedMaskL, mergedMaskR]
+        )
+
+        mask_subtract_button.click(
+            fn=merge_subtract_mask,
+            inputs=[maskL, maskR, mergedMaskL, mergedMaskR],
+            outputs=[mergedMaskL, mergedMaskR]
+        )
+
     with gr.Column():
         gr.Markdown("## Stage 4 - Add Job")
         crf_dropdown = gr.Dropdown(choices=[16,17,18,19,20,21,22], label="Encode CRF", value=16)
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, maskL, maskR, crf_dropdown],
-            outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR]
+            inputs=[input_video, projection_dropdown, mergedMaskL, mergedMaskR, crf_dropdown],
+            outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR]
         )
 
     with gr.Column():
