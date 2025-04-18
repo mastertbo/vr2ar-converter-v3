@@ -190,6 +190,8 @@ class FFmpegStream:
                 FFmpegStream.get_ffmpeg_command(),
                 '-hide_banner',
                 '-loglevel', 'error',
+                '-loop', '1',
+                '-t', '5',
                 '-y',
                 '-f', 'rawvideo',
                 '-vcodec','rawvideo',
@@ -200,10 +202,10 @@ class FFmpegStream:
                 '-pix_fmt', 'bgr24',
                 '-vsync', 'passthrough',
                 '-vcodec', 'rawvideo',
+                '-frames:v', '1',
                 '-an',
                 '-sn']
 
-        # TODO fix this
         if "filter_complex" in config:
             command += [
                 "-filter_complex", config["filter_complex"],
@@ -359,7 +361,8 @@ class FFmpegStream:
     @staticmethod
     def get_frame(
             video_path :str,
-            frame_number :int) -> np.ndarray:
+            frame_number :int,
+            filter_complex = None) -> np.ndarray:
         """ Get Video frame
 
         Args:
@@ -386,8 +389,15 @@ class FFmpegStream:
                 '-vcodec', 'rawvideo',
                 '-an',
                 '-sn',
-                '-'
             ]
+
+        if filter_complex is not None:
+            command += [
+                "-filter_complex", filter_complex,
+                "-map", "[v]",
+            ]
+
+        command += ['-']
 
         # print('cmd:', ' '.join(command))
         pipe = sp.Popen(

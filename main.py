@@ -304,28 +304,15 @@ def add_mark(frame):
     return result
 
 def get_frame(video, projection):
-    frame = FFmpegStream.get_frame(video.name, 0)
     if str(projection) == "eq":
-        configL = {
-            "video_filter": "crop=iw/2:ih:0:0,v360=input=he:output=fisheye:v_fov=${fov}:h_fov=${fov}:w=${width}:h=${height}",
-            "parameter": {
-                "width": MASK_SIZE,
-                "height": MASK_SIZE,
-                "fov": 180
-            }
-        }
-        configR = {
-            "video_filter": "crop=iw/2:ih:iw/2:0,v360=input=he:output=fisheye:v_fov=${fov}:h_fov=${fov}:w=${width}:h=${height}",
-            "parameter": {
-                "width": MASK_SIZE,
-                "height": MASK_SIZE,
-                "fov": 180
-            }
-        }
-
-        frameL = FFmpegStream.get_projection(frame, configL)
-        frameR = FFmpegStream.get_projection(frame, configR)
+        filter_complex = "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
+        frame = FFmpegStream.get_frame(video.name, 0, filter_complex)
+        width = 2*MASK_SIZE
+        frame = cv2.resize(frame, (int(width), int(width/2)))
+        frameL = frame[:, :int(width/2)]
+        frameR = frame[:, int(width/2):]
     else:
+        frame = FFmpegStream.get_frame(video.name, 0)
         width = 2*MASK_SIZE
         frame = cv2.resize(frame, (int(width), int(width/2)))
         frameL = frame[:, :int(width/2)]
