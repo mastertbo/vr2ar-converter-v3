@@ -12,8 +12,32 @@ from queue import Queue
 
 import subprocess as sp
 import numpy as np
-from utils.watchdog import Watchdog
 
+from threading import Timer
+
+class Watchdog(Exception):
+    def __init__(self, timeout_in_seconds, userHandler=None):
+        self.timeout = timeout_in_seconds
+        self.handler = userHandler if userHandler is not None else self.defaultHandler
+        self.timer = Timer(self.timeout, self.handler)
+        self.started = False
+
+    def start(self):
+        if not self.started:
+            self.started = True
+            self.timer.start()
+
+    def trigger(self):
+        self.timer.cancel()
+        self.timer = Timer(self.timeout, self.handler)
+        self.timer.start()
+
+    def stop(self):
+        try: self.timer.cancel()
+        except: pass
+
+    def defaultHandler(self):
+        raise self
 
 @dataclass
 class VideoInfo:
@@ -43,7 +67,7 @@ class FFmpegStream:
             skip_frames :int = 0,
             start_frame :int = 0,
             queue_size :int = 256,
-            watchdog_timeout_in_seconds :int = 10,
+            watchdog_timeout_in_seconds :int = 30,
             log_queue_overrun :bool = False):
 
         self.watchdog_timeout_in_seconds = watchdog_timeout_in_seconds
@@ -179,9 +203,11 @@ class FFmpegStream:
                 '-an',
                 '-sn']
 
+        # TODO fix this
         if "filter_complex" in config:
             command += [
-                "-filter_complex", config["filter_complex"]
+                "-filter_complex", config["filter_complex"],
+                "-map", "[v]",
             ]
  
         command += [
@@ -387,14 +413,10 @@ class FFmpegStream:
         """ Function to read transformed frames from ffmpeg video stream into a queue """
 
         try:
-            video_filter = self.config['video_filter']
-            for k, v in self.config['parameter'].items():
-                video_filter = video_filter.replace('${' + k + '}', str(v))
+            height_factor = 1
+            width_factor = 1
 
             seek = FFmpegStream.frame_to_timestamp(self.start_frame, self.video_info.fps)
-
-            width_factor = 2 if "out_stereo=sbs" in video_filter else 1
-            height_factor = 2 if "out_stereo=tb" in video_filter else 1
 
             command = [
                     FFmpegStream.get_ffmpeg_command(),
@@ -408,10 +430,30 @@ class FFmpegStream:
                     '-vsync', 'passthrough',
                     '-vcodec', 'rawvideo',
                     '-an',
-                    '-sn',
-                    '-vf', video_filter,
-                    '-'
+                    '-sn'
                 ]
+
+            if "filter_complex" in self.config:
+                command += [
+                    "-filter_complex", self.config["filter_complex"],
+                    "-map", "[v]",
+                ]
+
+            if "video_filter" in self.config:
+                video_filter = self.config['video_filter']
+                for k, v in self.config['parameter'].items():
+                    video_filter = video_filter.replace('${' + k + '}', str(v))
+                if "out_stereo=sbs" in video_filter: 
+                    height_factor = 2
+                if "out_stereo=tb" in video_filter:
+                        width_factor = 2
+                command += [
+                    '-vf', video_filter,
+                ]
+
+            command += [
+                '-'
+            ]
 
             self.watchdog.start()
             self.logger.info("FFmpeg Stream Watchdog started with %d sec timeout", self.watchdog_timeout_in_seconds)
@@ -479,3 +521,31 @@ class FFmpegStream:
             self.stopped = True
             self.logger.critical("FFmpegStream crashed due to a fatal error", exc_info=ex)
 
+if __name__ == "__main__":
+    src = "test.mp4"
+    video_info = FFmpegStream.get_video_info(src)
+    #example stream eq as fisheye180
+    config = {
+        "filter_complex": "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]",
+        "parameter": {
+            "width": video_info.width,
+            "height": video_info.height,
+        }
+    }
+    ffmpeg = FFmpegStream(
+        video_path = src,
+        config = config,
+        skip_frames = 0
+    )
+
+    i = 0
+    while ffmpeg.isOpen():
+        img = ffmpeg.read()
+        if img is None:
+            break
+        i += 1
+        print(i)
+        # cv2.imwrite("debug.png", img)
+        # break
+
+    ffmpeg.stop()
