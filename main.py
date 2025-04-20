@@ -175,11 +175,9 @@ def process(job_id, video, projection, maskL, maskR, crf = 16):
         mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
         mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
 
-        combined_image = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-        combined_image = cv2.resize(combined_image, (video_info.width, video_info.height))
+        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
         
-        _, binary = cv2.threshold(combined_image, 127, 255, cv2.THRESH_BINARY)
-        writer.add_frame(img, binary)
+        writer.add_frame(img, combined_mask)
 
         gc.collect()
 
