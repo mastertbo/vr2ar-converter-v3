@@ -74,7 +74,7 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(job_id, video, projection, maskL, maskR, crf = 16):
+def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     global WORKER_STATUS
 
     _, mask_h = maskL.size
@@ -172,8 +172,9 @@ def process(job_id, video, projection, maskL, maskR, crf = 16):
         mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
         mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
 
-        mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-        mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
+        if erode:
+            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
+            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
 
         combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
         
@@ -229,7 +230,7 @@ def background_worker():
         if job is None:
             break
         print("Start job", job['id'])
-        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'])
+        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
         if mask is not None:
             mask_list.append(mask)
         if result is not None:
@@ -238,7 +239,7 @@ def background_worker():
         time.sleep(5)
         WORKER_STATUS = "Idle"
 
-def add_job(video, projection, maskL, maskR, crf):
+def add_job(video, projection, maskL, maskR, crf, erode):
     global job_id
 
     if video is None:
@@ -264,7 +265,8 @@ def add_job(video, projection, maskL, maskR, crf):
         'projection': projection,
         'crf': crf,
         'maskL': Image.fromarray(maskL).convert('L'),
-        'maskR': Image.fromarray(maskR).convert('L')
+        'maskR': Image.fromarray(maskR).convert('L'),
+        'erode': erode
     })
 
     return None, None, None, None, None, None, None, None, None, None, None, None, None
@@ -691,10 +693,11 @@ with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("## Stage 4 - Add Job")
         crf_dropdown = gr.Dropdown(choices=[16,17,18,19,20,21,22], label="Encode CRF", value=16)
+        erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=False, info="")
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, mergedMaskL, mergedMaskR, crf_dropdown],
+            inputs=[input_video, projection_dropdown, mergedMaskL, mergedMaskR, crf_dropdown, erode_checkbox],
             outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMaskL, previewMergedMaskR ]
         )
 
