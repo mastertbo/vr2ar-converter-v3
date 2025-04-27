@@ -16,3 +16,4 @@ torchvision
 tqdm>=4.66.1
 yapf
 transformers
+requests
