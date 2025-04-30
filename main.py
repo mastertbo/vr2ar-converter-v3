@@ -19,6 +19,7 @@ import time
 import threading
 import queue
 import subprocess
+import requests
 import random
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
@@ -225,7 +226,24 @@ result_list = []
 def background_worker():
     global file_list
     global WORKER_STATUS
+    surplus_url = os.environ.get('JOB_SURPLUS_CHECK_URL')
     while True:
+        if task_queue.empty():
+            time.sleep(1)
+            continue
+
+        if surplus_url:
+            try:
+                start_job = "True" in str(requests.get(surplus_url).json())
+            except Exception as ex:
+                start_job = False
+                print(ex)
+
+            if not start_job:
+                WORKER_STATUS = "Wait for surplus"
+                time.sleep(30)
+                continue
+
         job = task_queue.get()
         if job is None:
             break
