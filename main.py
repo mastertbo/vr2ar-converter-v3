@@ -12,12 +12,15 @@ import gradio as gr
 import subprocess
 import tempfile
 import shutil
+import pickle
 import torch
 import cv2
 import gc
+import glob
 import time
 import threading
 import queue
+import asyncio
 import subprocess
 import requests
 import random
@@ -33,6 +36,7 @@ from matanyone.inference.inference_core import InferenceCore
 from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
+from filebrowser_client import FilebrowserClient
 
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
@@ -83,11 +87,10 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     maskL = fix_mask2(maskL)
     maskR = fix_mask2(maskR)
 
-    original_filename = os.path.basename(video.name)
+    original_filename = os.path.basename(video)
     file_name, file_extension = os.path.splitext(original_filename)
-    file_name = str(job_id).zfill(4) + "_" + file_name
     
-    video_info = FFmpegStream.get_video_info(video.name)
+    video_info = FFmpegStream.get_video_info(video)
     
     reader_config = {
         "parameter": {
@@ -110,7 +113,7 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     has_cuda = torch.torch.cuda.is_available()
 
     ffmpeg = FFmpegStream(
-        video_path = video.name,
+        video_path = video,
         config = reader_config,
         skip_frames = 0
     )
@@ -205,7 +208,7 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     subprocess.run([
         "ffmpeg",
         "-i", result_tmp_name,
-        "-i", video.name,
+        "-i", video,
         "-c", "copy",
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -215,12 +218,10 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     os.remove(result_tmp_name)
 
     WORKER_STATUS = f"Convertion completed" 
-    return (None, result_name)
+    return result_name
 
 
 job_id = 0
-task_queue = queue.Queue()
-mask_list = []
 result_list = []
 
 def background_worker():
@@ -228,10 +229,6 @@ def background_worker():
     global WORKER_STATUS
     surplus_url = os.environ.get('JOB_SURPLUS_CHECK_URL')
     while True:
-        if task_queue.empty():
-            time.sleep(1)
-            continue
-
         if surplus_url:
             try:
                 start_job = "True" in str(requests.get(surplus_url).json())
@@ -244,17 +241,41 @@ def background_worker():
                 time.sleep(30)
                 continue
 
-        job = task_queue.get()
-        if job is None:
-            break
+        pkl = [x for x in glob.glob("/jobs/*.pkl")]
+
+        if len(pkl) == 0:
+            time.sleep(2)
+            continue
+
+        pkl = sorted(pkl)[0]
+        time.sleep(2) # ensure file is fully written
+        with open(pkl, 'rb') as f:
+            job = pickle.load(f)
+
         print("Start job", job['id'])
-        (mask, result) = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
-        if mask is not None:
-            mask_list.append(mask)
+        result = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
         if result is not None:
             result_list.append(result)
-        task_queue.task_done()
-        time.sleep(5)
+            if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
+                WORKER_STATUS = "Uploading..."
+                if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
+                    client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
+                else:
+                    client = FilebrowserClient(filebrowser_host, insecure=True)
+
+                asyncio.run(client.connect())
+                couroutine = client.upload(
+                    local_path=result,
+                    remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
+                    override=False,
+                    concurrent=1,
+                )
+                asyncio.run(couroutine)
+
+
+        os.remove(job['video'])
+        os.remove(pkl)
+        time.sleep(1)
         WORKER_STATUS = "Idle"
 
 def add_job(video, projection, maskL, maskR, crf, erode):
@@ -277,22 +298,31 @@ def add_job(video, projection, maskL, maskR, crf, erode):
 
     job_id += 1
     print("Add job", job_id)
-    task_queue.put({
+
+    ts = str(int(time.time()))
+
+    dest = '/jobs/' + ts + os.path.basename(video.name)
+    shutil.move(video.name, dest)
+
+    job_data = {
         'id': job_id,
-        'video': video,
+        'video': dest,
         'projection': projection,
         'crf': crf,
         'maskL': Image.fromarray(maskL).convert('L'),
         'maskR': Image.fromarray(maskR).convert('L'),
         'erode': erode
-    })
+    }
+
+    with open(f"/jobs/{ts}.pkl", "wb") as f:
+        pickle.dump(job_data, f)
 
     return None, None, None, None, None, None, None, None, None, None, None, None, None
 
 def status_text():
-    global task_queue
+    pending_jobs = len([x for x in glob.glob("/jobs/*.pkl")])
     return "Worker Status: " + WORKER_STATUS + "\n" \
-        + f"Pending Jobs: {task_queue.qsize()}"
+        + f"Pending Jobs: {pending_jobs}"
 
 current_origin_frame = {
     "L": None,
@@ -722,9 +752,8 @@ with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("## Job Results")
         status = gr.Textbox(label="Status", lines=2)
-        mask_videos = gr.File(value=[], label="Download Mask Videos", visible=True)
         output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
-        restart_button = gr.Button("Clear all jobs and data".upper())
+        restart_button = gr.Button("CLEANUP AND RESTART".upper())
         restart_button.click(
             # dirty hack, we use k8s restart pod
             fn=lambda: os.system("pkill python"),
@@ -736,9 +765,7 @@ with gr.Blocks() as demo:
     timer5 = gr.Timer(5, active=True)
     timer1.tick(status_text, outputs=status)
     timer5.tick(lambda: result_list, outputs=output_videos)
-    timer5.tick(lambda: mask_list, outputs=mask_videos)
     demo.load(fn=status_text, outputs=status)
-    demo.load(fn=lambda: mask_list, outputs=mask_videos)
     demo.load(fn=lambda: result_list, outputs=output_videos)
 
 
