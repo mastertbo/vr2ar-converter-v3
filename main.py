@@ -40,6 +40,9 @@ from filebrowser_client import FilebrowserClient
 
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
+SECONDS = 10
+WARMUP = 4
+JOB_VERSION = 1
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -79,13 +82,11 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
+def process(video, projection, masks, crf = 16, erode = False):
     global WORKER_STATUS
 
-    _, mask_h = maskL.size
-
-    maskL = fix_mask2(maskL)
-    maskR = fix_mask2(maskR)
+    maskIdx = 0
+    _, mask_h = masks[maskIdx]['maskL'].size
 
     original_filename = os.path.basename(video)
     file_name, file_extension = os.path.splitext(original_filename)
@@ -108,8 +109,6 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     current_frame = 0
     objects = [1]
 
-    # adopted from published repo
-    WARMUP = 10
     has_cuda = torch.torch.cuda.is_available()
 
     ffmpeg = FFmpegStream(
@@ -134,6 +133,14 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     matanyone2 = matanyone2.eval()
     processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
 
+    for i in range(len(masks)):
+        imgLV = prepare_frame(masks[i]['frameL'], has_cuda)
+        imgRV = prepare_frame(masks[i]['frameR'], has_cuda)
+        imgLMask = fix_mask2(masks[i]['maskL'])
+        imgRMask = fix_mask2(masks[i]['maskR'])
+        _ = processor1.step(imgLV, imgLMask, objects=objects, force_permanent=True)
+        _ = processor2.step(imgRV, imgRMask, objects=objects, force_permanent=True)
+
     while ffmpeg.isOpen():
         img = ffmpeg.read()
         if img is None:
@@ -149,23 +156,25 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
         imgLV = prepare_frame(imgL, has_cuda)
         imgRV = prepare_frame(imgR, has_cuda)
 
-        if current_frame == 1:
-            imgLMask = maskL
-            imgRMask = maskR
+        if maskIdx < len(masks) and np.array_equal(masks[maskIdx]['frameL'], imgL) and np.array_equal(masks[maskIdx]['frameR'], imgR):
+            imgLMask = fix_mask2(masks[maskIdx]['maskL'])
+            imgRMask = fix_mask2(masks[maskIdx]['maskR'])
+            maskIdx += 1
 
             output_prob_L = processor1.step(imgLV, imgLMask, objects=objects)
             output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
             
-            for i in range(WARMUP):
-                WORKER_STATUS = f"Warmup MatAnyone {i+1}/{WARMUP}"
-                output_prob_L = processor1.step(imgLV, first_frame_pred=True)
-                output_prob_R = processor2.step(imgRV, first_frame_pred=True)
-        else:
+            for _ in range(WARMUP):
+                output_prob_L = processor1.step(imgLV, first_frame_pred=maskIdx==1)
+                output_prob_R = processor2.step(imgRV, first_frame_pred=maskIdx==1)
+        elif maskIdx > 0:
             output_prob_L = processor1.step(imgLV)
             output_prob_R = processor2.step(imgRV)
+        else:
+            print("Warning: Start frame not found yet")
+            continue
 
         WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length}"
-        # print(WORKER_STATUS)
 
         mask_output_L = processor1.output_prob_to_mask(output_prob_L)
         mask_output_R = processor2.output_prob_to_mask(output_prob_R)
@@ -221,8 +230,8 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     return result_name
 
 
-job_id = 0
 result_list = []
+frame_name = None
 
 def background_worker():
     global file_list
@@ -252,25 +261,26 @@ def background_worker():
         with open(pkl, 'rb') as f:
             job = pickle.load(f)
 
-        print("Start job", job['id'])
-        result = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
-        if result is not None:
-            result_list.append(result)
-            if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
-                WORKER_STATUS = "Uploading..."
-                if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
-                    client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
-                else:
-                    client = FilebrowserClient(filebrowser_host, insecure=True)
+        if job['version'] == JOB_VERSION:
+            print("Start job")
+            result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'])
+            if result is not None:
+                result_list.append(result)
+                if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
+                    WORKER_STATUS = "Uploading..."
+                    if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
+                        client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
+                    else:
+                        client = FilebrowserClient(filebrowser_host, insecure=True)
 
-                asyncio.run(client.connect())
-                couroutine = client.upload(
-                    local_path=result,
-                    remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
-                    override=False,
-                    concurrent=1,
-                )
-                asyncio.run(couroutine)
+                    asyncio.run(client.connect())
+                    couroutine = client.upload(
+                        local_path=result,
+                        remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
+                        override=False,
+                        concurrent=1,
+                    )
+                    asyncio.run(couroutine)
 
 
         os.remove(job['video'])
@@ -278,46 +288,53 @@ def background_worker():
         time.sleep(1)
         WORKER_STATUS = "Idle"
 
-def add_job(video, projection, maskL, maskR, crf, erode):
-    global job_id
-
+def add_job(video, projection, crf, erode):
     if video is None:
-        raise gr.Error("video missing", duration=3)
+        gr.Warning("Could not add Job: Video not found", duration=5)
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
-    if maskL is None: 
-        raise gr.Error("maskL not set", duration=3)
+    if not all(os.path.exists(os.path.join(x, '0000.png')) for x in ["masksL", "masksR"]):
+        gr.Warning("Could not add Job: Mask for first frame does not exists", duration=5)
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
-    if maskR is None:
-        raise gr.Error("maskR not set", duration=3)
+    masksFiles = sorted([f for f in os.listdir('masksL') if f.endswith(".png") and os.path.exists(os.path.join('masksR', f))])
+    masks = []
+    for f in masksFiles:
+        frame = cv2.imread(os.path.join('frames', f))
+        width = 2*MASK_SIZE
 
-    if Image.fromarray(maskL).convert("L").getextrema() == (0, 0):
-        raise gr.Error("maskL is empty", duration=3)
+        frameL = frame[:, :int(width/2)]
+        frameR = frame[:, int(width/2):]
 
-    if Image.fromarray(maskR).convert("L").getextrema() == (0, 0):
-        raise gr.Error("maskR is empty", duration=3)
+        masks.append({
+            'maskL': Image.open(os.path.join('masksL', f)).convert('L'),
+            'maskR': Image.open(os.path.join('masksR', f)).convert('L'),
+            'frameL': frameL,
+            'frameR': frameR,
+        })
 
-    job_id += 1
-    print("Add job", job_id)
+    if len(masks) == 0:
+        gr.Warning("Could not add Job: Mask Missing", duration=5)
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
     ts = str(int(time.time()))
 
-    dest = '/jobs/' + ts + os.path.basename(video.name)
+    dest = '/jobs/' + ts + "_" + os.path.basename(video.name)
     shutil.move(video.name, dest)
 
     job_data = {
-        'id': job_id,
+        'version': JOB_VERSION,
         'video': dest,
         'projection': projection,
         'crf': crf,
-        'maskL': Image.fromarray(maskL).convert('L'),
-        'maskR': Image.fromarray(maskR).convert('L'),
+        'masks': masks,
         'erode': erode
     }
 
     with open(f"/jobs/{ts}.pkl", "wb") as f:
         pickle.dump(job_data, f)
 
-    return None, None, None, None, None, None, None, None, None, None, None, None, None
+    return None, None, None, None, None, None, None, None, None, None, None, None
 
 def status_text():
     pending_jobs = len([x for x in glob.glob("/jobs/*.pkl")])
@@ -351,20 +368,51 @@ def add_mark(frame):
         cv2.drawMarker(result, (x, y), colors[label], markerType=markers[label], markerSize=marker_final_size, thickness=marker_final_thickness)
     return result
 
-def get_frame(video, projection):
+
+def generate_gallery_list():
+    frames = sorted([os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")])
+    for idx in range(len(frames)):
+        if os.path.exists(frames[idx].replace('frames', 'previews')):
+            frames[idx] = frames[idx].replace('frames', 'previews')
+    gallery_items = [(frame, str(str(max(0, int(idx*SECONDS - SECONDS/2))) + " sec")) for idx, frame in enumerate(frames)]
+    return gallery_items
+
+def extract_frames(video, projection):
+    for dir in ["frames", "previews", "masksL", 'masksR']:
+        if os.path.exists(dir):
+            shutil.rmtree(dir)
+
+        os.makedirs(dir, exist_ok=True)
+
     if str(projection) == "eq":
-        filter_complex = "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
-        frame = FFmpegStream.get_frame(video.name, 0, filter_complex)
-        width = 2*MASK_SIZE
-        frame = cv2.resize(frame, (int(width), int(width/2)))
-        frameL = frame[:, :int(width/2)]
-        frameR = frame[:, int(width/2):]
+        filter_complex = "split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
+        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
+        os.system(f"ffmpeg -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
     else:
-        frame = FFmpegStream.get_frame(video.name, 0)
-        width = 2*MASK_SIZE
-        frame = cv2.resize(frame, (int(width), int(width/2)))
-        frameL = frame[:, :int(width/2)]
-        frameR = frame[:, int(width/2):]
+        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 frames/0000.png")
+        os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -start_number 1 frames/%04d.png")
+    
+    frames = [os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")]
+
+    #NOTE: use same method for resizing to get pixel exact matches
+    for frame in frames:
+        img_scaled = cv2.resize(cv2.imread(frame), (2*MASK_SIZE, MASK_SIZE))
+        cv2.imwrite(frame, img_scaled)
+
+    return generate_gallery_list()
+
+def get_selected(selected):
+    global frame_name
+    if selected is None or "image" not in selected:
+        return None, None, None, None, None, None
+
+    frame_name = os.path.basename(selected['image']['path'])
+    frame = cv2.imread(selected['image']['path'].replace('previews', 'frames'))
+    
+    width = 2*MASK_SIZE
+
+    frameL = frame[:, :int(width/2)]
+    frameR = frame[:, int(width/2):]
 
     frameL = cv2.cvtColor(frameL, cv2.COLOR_BGR2RGB)
     frameR = cv2.cvtColor(frameR, cv2.COLOR_BGR2RGB)
@@ -372,7 +420,21 @@ def get_frame(video, projection):
     current_origin_frame['L'] = ImageFrame(frameL, 0)
     current_origin_frame['R'] = ImageFrame(frameR, 0)
 
-    return Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(frameL), Image.fromarray(frameR), Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L"), Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L")
+    maskL = Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L")
+    maskR = Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L")
+
+    if os.path.exists(os.path.join('masksL', frame_name)):
+        maskL = Image.open(os.path.join('masksL', frame_name)).convert("L")
+
+    if os.path.exists(os.path.join('masksR', frame_name)):
+        maskR = Image.open(os.path.join('masksR', frame_name)).convert("L")
+
+    return Image.fromarray(frameL), \
+        Image.fromarray(frameR), \
+        Image.fromarray(frameL), \
+        Image.fromarray(frameR), \
+        maskL, \
+        maskR
 
 def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThreshold, maskLNegativePrompt, maskRNegativePrompt):
     if frameL is None or frameR is None:
@@ -473,16 +535,59 @@ def get_mask2():
 
     return previewL, maskL, previewR, maskR
 
-def merge_add_mask(maskL, maskR, mergedMaskL, mergedMaskR):
+def generate_mask_preview(mask, eye: str):
+    if mask is None:
+        return None
+
+    frame = current_origin_frame[eye].frame_data
+    if frame is None:
+        return None
+
+    mask = Image.fromarray(mask).convert("L")
+    preview = Image.composite(
+        Image.new("RGB", mask.size, "blue"),
+        Image.fromarray(frame).convert("RGBA"),
+        mask.point(lambda p: 100 if p > 1 else 0)
+    )
+
+    return preview
+
+def postprocess_mask(maskL, maskR, dilate, erode):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+
+    # first dilate then erode to ensure to fill holes
+    maskL = cv2.dilate(maskL, kernel, iterations=dilate)
+    maskL = cv2.erode(maskL, kernel, iterations=erode)
+    maskR = cv2.dilate(maskR, kernel, iterations=dilate)
+    maskR = cv2.erode(maskR, kernel, iterations=erode)
+
+    maskL = Image.fromarray(maskL).convert("L")
+    maskL.save(os.path.join('masksL', frame_name))
+    maskR = Image.fromarray(maskR).convert("L")
+    maskR.save(os.path.join('masksR', frame_name))
+
+    pL = generate_mask_preview(np.array(maskL), 'L')
+    pR = generate_mask_preview(np.array(maskR), 'R')
+    if pL is not None and pR is not None:
+        pL = cv2.cvtColor(np.array(pL), cv2.COLOR_RGB2BGR)
+        pR = cv2.cvtColor(np.array(pR), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join('previews', frame_name), cv2.hconcat([pL, pR]))
+
+    return maskL, maskR, generate_gallery_list(), os.path.join('previews', frame_name)
+
+def merge_add_mask(maskL, maskR, mergedMaskL, mergedMaskR, dilate, erode):
     if maskL is not None and mergedMaskL is not None:
         mergedMaskL = np.bitwise_or(np.array(mergedMaskL), np.array(maskL))
         mergedMaskL = Image.fromarray(mergedMaskL).convert("L")
     if maskR is not None and mergedMaskR is not None:
         mergedMaskR = np.bitwise_or(np.array(mergedMaskR), np.array(maskR))
         mergedMaskR = Image.fromarray(mergedMaskR).convert("L")
-    return  mergedMaskL, mergedMaskR
 
-def merge_subtract_mask(maskL, maskR, mergedMaskL, mergedMaskR):
+    a, b, c, d = postprocess_mask(np.array(mergedMaskL), np.array(mergedMaskR), dilate, erode)
+
+    return  mergedMaskL, mergedMaskR, a, b, c, d
+
+def merge_subtract_mask(maskL, maskR, mergedMaskL, mergedMaskR, dilate, erode):
     if maskL is not None and mergedMaskL is not None:
         invMaskL = 255 - np.array(maskL)
         mergedMaskL = np.bitwise_and(np.array(mergedMaskL), invMaskL)
@@ -491,45 +596,49 @@ def merge_subtract_mask(maskL, maskR, mergedMaskL, mergedMaskR):
         invMaskR = 255 - np.array(maskR)
         mergedMaskR = np.bitwise_and(np.array(mergedMaskR), invMaskR)
         mergedMaskR = Image.fromarray(mergedMaskR).convert("L")
-    return  mergedMaskL, mergedMaskR
+
+    a, b, c, d = postprocess_mask(np.array(mergedMaskL), np.array(mergedMaskR), dilate, erode) 
+
+    return  mergedMaskL, mergedMaskR, a, b, c, d
 
 def set_mask_size(x):
     global MASK_SIZE
     MASK_SIZE = int(x)
 
-def update_maskL_preview(maskL):
-    if maskL is None:
-        return None
-
+def generate_example(maskL, maskR):
     frameL = current_origin_frame['L'].frame_data
-    if frameL is None:
-        return None
-
-    maskL = Image.fromarray(maskL).convert("L")
-    previewL = Image.composite(
-        Image.new("RGB", maskL.size, "blue"),
-        Image.fromarray(frameL).convert("RGBA"),
-        maskL.point(lambda p: 100 if p > 1 else 0)
-    )
-
-    return previewL
-
-def update_maskR_preview(maskR):
-    if maskR is None:
-        return None
-
     frameR = current_origin_frame['R'].frame_data
-    if frameR is None:
-        return None
 
-    maskR = Image.fromarray(maskR).convert("L")
-    previewR = Image.composite(
-        Image.new("RGB", maskR.size, "blue"),
-        Image.fromarray(frameR).convert("RGBA"),
-        maskR.point(lambda p: 100 if p > 1 else 0)
-    )
+    with torch.no_grad():
+        matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
+        if torch.torch.cuda.is_available():
+            matanyone1 = matanyone1.cuda()
+        matanyone1 = matanyone1.eval()
+        processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
 
-    return previewR
+        result = []
+
+        maskL = np.array(Image.fromarray(maskL).convert("L"))
+        maskR = np.array(Image.fromarray(maskR).convert("L"))
+        for (frame, mask) in [(frameL, maskL), (frameR, maskR)]:
+            objects = [1]
+            mask = fix_mask2(mask)
+            frame = prepare_frame(frame, torch.torch.cuda.is_available())
+            output_prob = processor1.step(frame, mask, objects=objects)
+            for _ in range(WARMUP):
+                output_prob = processor1.step(frame, first_frame_pred=True)
+            mask_output = processor1.output_prob_to_mask(output_prob)
+            mask_output_pha = mask_output.unsqueeze(2).cpu().detach().numpy()
+            mask_output_pha = (mask_output_pha*255).astype(np.uint8)
+            result.append(mask_output_pha)
+
+    # Workaround since Pillow can not laod directly?
+    cv2.imwrite("tmp_l.png", result[0])
+    cv2.imwrite("tmp_r.png", result[1])
+
+    return generate_mask_preview(cv2.imread("tmp_l.png"), 'L'), generate_mask_preview(cv2.imread('tmp_r.png'), 'R')
+
+
 
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
@@ -538,8 +647,8 @@ with gr.Blocks() as demo:
         1. Upload Your video
         2. Select Video Source Format
         3. Select Mask Size (Higher value require more VRAM!)
-        3. Extract first projection Frame
-        4. Generate Initial Mask with Button. Use Points or Prompts to generate individual Masks and merge them with add or subtract button to the initial mask. To create a second mask with points you have to use the crea button to select the points for the next partial mask. Use the foreground and subtract to remove areas from mask. use foreground and add to add areas to the inital mask. You can also try to specify additional backrground points but for me this always results in worse results.
+        3. Extract Frames
+        4. Generate Initial Mask. Use Points or Prompts to generate individual Masks and merge them with add or subtract button to the initial mask. To create a second mask with points you have to use the crea button to select the points for the next partial mask. Use the foreground and subtract to remove areas from mask. use foreground and add to add areas to the inital mask. You can also try to specify additional backrground points but for me this always results in worse results.
         5. Add Video Mask Job
     ''')
     with gr.Column():
@@ -558,15 +667,19 @@ with gr.Blocks() as demo:
             inputs=mask_size
         )
 
+
     with gr.Column():
         gr.Markdown("## Stage 2 - Extract First Frame")
         frame_button = gr.Button("Extract Projection Frame")
-        gr.Markdown("### Result")
+        gr.Markdown("### Frames")
+        gr.Markdown("Important: You need to provide a mask for 0 sec, Masks for the other frames are optional")
+        gallery = gr.Gallery(label="Extracted Frames", show_label=True, columns=4, object_fit="contain")
+        select_button = gr.Button("Load Slected Projection Frame")
         with gr.Row():
             framePreviewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
             framePreviewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
 
-    gr.Markdown("## Stage 3 - Generate Initial Mask")
+    gr.Markdown("## Stage 3 - Generate Mask")
     with gr.Tabs():
         with gr.Tab("Prompt"):
             with gr.Column():
@@ -667,8 +780,6 @@ with gr.Blocks() as demo:
             mask2_button = gr.Button("Generate Mask")
 
 
-
-
     with gr.Column():
         gr.Markdown("### Mask Step 1")
         gr.Markdown("Preview")
@@ -691,26 +802,48 @@ with gr.Blocks() as demo:
             mergedMaskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
             mergedMaskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
 
-        gr.Markdown("Preview")
+        gr.Markdown("Postporcessed Mask")
+        mask_dilate = gr.Slider(minimum=0, maximum=10, step=1, value=1, label="Dilate Iterrations")
+        mask_erode = gr.Slider(minimum=0, maximum=10, step=1, value=3, label="Erode Iterrations")
         with gr.Row():
-            previewMergedMaskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
-            previewMergedMaskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            postprocessedMaskL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            postprocessedMaskR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
 
-        mergedMaskL.change(
-            fn=update_maskL_preview, 
-            inputs=mergedMaskL, 
-            outputs=previewMergedMaskL
+        gr.Markdown("Preview")
+        previewMergedMask = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+
+        gr.Markdown("Optional: Generate MatAnyone Example Output (For debug purpose only)")
+        example_button = gr.Button("Generate Example Output")
+        with gr.Row():
+            exampleL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+            exampleR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+
+        mask_dilate.change(
+            fn=postprocess_mask,
+            inputs=[mergedMaskL, mergedMaskR, mask_dilate, mask_erode],
+            outputs=[postprocessedMaskL, postprocessedMaskR, gallery, previewMergedMask]
         )
 
-        mergedMaskR.change(
-            fn=update_maskR_preview, 
-            inputs=mergedMaskR, 
-            outputs=previewMergedMaskR
+        mask_erode.change(
+            fn=postprocess_mask,
+            inputs=[mergedMaskL, mergedMaskR, mask_dilate, mask_erode],
+            outputs=[postprocessedMaskL, postprocessedMaskR, gallery, previewMergedMask]
         )
 
         frame_button.click(
-            fn=get_frame,
+            fn=extract_frames,
             inputs=[input_video, projection_dropdown],
+            outputs=[gallery]
+        )
+
+        selected_frame = gr.State(None)
+        def store_index(evt: gr.SelectData):
+            return evt.value
+
+        gallery.select(store_index, None, selected_frame)
+        select_button.click(
+            fn=get_selected,
+            inputs=[selected_frame],
             outputs=[framePreviewL, framePreviewR, maskSelectionL, maskSelectionR, mergedMaskL, mergedMaskR]
         )
 
@@ -728,14 +861,20 @@ with gr.Blocks() as demo:
 
         mask_add_button.click(
             fn=merge_add_mask,
-            inputs=[maskL, maskR, mergedMaskL, mergedMaskR],
-            outputs=[mergedMaskL, mergedMaskR]
+            inputs=[maskL, maskR, mergedMaskL, mergedMaskR, mask_dilate, mask_erode],
+            outputs=[mergedMaskL, mergedMaskR, postprocessedMaskL, postprocessedMaskR, gallery, previewMergedMask]
         )
 
         mask_subtract_button.click(
             fn=merge_subtract_mask,
-            inputs=[maskL, maskR, mergedMaskL, mergedMaskR],
-            outputs=[mergedMaskL, mergedMaskR]
+            inputs=[maskL, maskR, mergedMaskL, mergedMaskR, mask_dilate, mask_erode],
+            outputs=[mergedMaskL, mergedMaskR, postprocessedMaskL, postprocessedMaskR, gallery, previewMergedMask]
+        )
+
+        example_button.click(
+            fn=generate_example,
+            inputs=[postprocessedMaskL, postprocessedMaskR],
+            outputs=[exampleL, exampleR]
         )
 
     with gr.Column():
@@ -745,8 +884,8 @@ with gr.Blocks() as demo:
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, mergedMaskL, mergedMaskR, crf_dropdown, erode_checkbox],
-            outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMaskL, previewMergedMaskR ]
+            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox],
+            outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMask ]
         )
 
     with gr.Column():
