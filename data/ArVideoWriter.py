@@ -18,7 +18,7 @@ class ArVideoWriter:
         self.fps = fps
         self.crf = crf
         self.mask_img = cv2.imread("mask.png", cv2.IMREAD_UNCHANGED)
-        self.process_buffer = Queue(maxsize=256)
+        self.process_buffer = Queue(maxsize=8)
         self.thread = Thread(target=self.run, args=())
         self.thread.daemon = True
         self.thread.start()
@@ -28,7 +28,7 @@ class ArVideoWriter:
 
     def add_frame(self, frame, alpha):
         while self.process_buffer.full():
-            time.sleep(0.05)
+            time.sleep(0.01)
         self.process_buffer.put((frame, alpha))
 
     def finalize(self):
@@ -140,7 +140,7 @@ class ArVideoWriter:
     def run(self):
         while self.process_buffer.qsize() > 0 or not self.complete:
             if self.process_buffer.qsize() < 1:
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
 
             (frame, alpha) = self.process_buffer.get()
