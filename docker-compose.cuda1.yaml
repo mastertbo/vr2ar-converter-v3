@@ -2,7 +2,7 @@ services:
   vr2ar:
     # build:
     #  context: .
-    image: "ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest"
+    image: "docker.io/milkjeff/vr2arconverterv3:latest"
     deploy:
       resources:
         reservations:
