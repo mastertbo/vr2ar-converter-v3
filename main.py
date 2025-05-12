@@ -23,6 +23,11 @@ import queue
 import asyncio
 import subprocess
 import requests
+import argparse
+import json
+import redis
+import boto3
+import io
 import random
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
@@ -769,13 +774,89 @@ with gr.Blocks() as demo:
     demo.load(fn=lambda: result_list, outputs=output_videos)
 
 
+
+# --- Distributed/queue mode functions ---
+def launch_ui(redis_url, s3_bucket):
+    r = redis.Redis.from_url(redis_url)
+    s3 = boto3.client("s3")
+    def enqueue_job(video, projection, maskL, maskR, crf, erode):
+        # upload video
+        vid_key = f"inputs/{int(time.time())}_{os.path.basename(video.name)}"
+        s3.upload_fileobj(video, s3_bucket, vid_key)
+        # serialize and upload maskL
+        mask_key = vid_key.replace("inputs/", "masks/").rsplit('.',1)[0] + "_L.png"
+        buf = io.BytesIO()
+        maskL.save(buf, format="PNG")
+        buf.seek(0)
+        s3.upload_fileobj(buf, s3_bucket, mask_key)
+        # serialize and upload maskR
+        mask_keyR = vid_key.replace("inputs/", "masks/").rsplit('.',1)[0] + "_R.png"
+        buf2 = io.BytesIO()
+        maskR.save(buf2, format="PNG")
+        buf2.seek(0)
+        s3.upload_fileobj(buf2, s3_bucket, mask_keyR)
+        # enqueue JSON job
+        job = {
+            "video_key": vid_key,
+            "maskL_key": mask_key,
+            "maskR_key": mask_keyR,
+            "projection": projection,
+            "crf": crf,
+            "erode": erode
+        }
+        r.lpush("video_jobs", json.dumps(job))
+        return None, None, None, None, None, None, None, None, None, None, None, None, None
+    # rebind add_button to enqueue_job
+    add_button.click(
+        fn=enqueue_job,
+        inputs=[input_video, projection_dropdown, maskL, maskR, crf_dropdown, erode_checkbox],
+        outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR,
+                 maskSelectionL, maskSelectionR, mergedMaskL, mergedMaskR, previewMergedMaskL, previewMergedMaskR]
+    )
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+def run_worker(redis_url, s3_bucket):
+    r = redis.Redis.from_url(redis_url)
+    s3 = boto3.client("s3")
+    while True:
+        item = r.brpop("video_jobs", timeout=60)
+        if not item:
+            print("Queue empty, exiting")
+            break
+        _, raw = item
+        job = json.loads(raw)
+        # download inputs
+        s3.download_file(s3_bucket, job["video_key"], "/tmp/in.mp4")
+        s3.download_file(s3_bucket, job["maskL_key"], "/tmp/mask_L.png")
+        s3.download_file(s3_bucket, job["maskR_key"], "/tmp/mask_R.png")
+        # process
+        result_path = process(
+            0,
+            "/tmp/in.mp4",
+            job["projection"],
+            Image.open("/tmp/mask_L.png").convert("L"),
+            Image.open("/tmp/mask_R.png").convert("L"),
+            job["crf"],
+            job["erode"]
+        )
+        # upload output
+        out_key = job["video_key"].replace("inputs/", "outputs/")
+        s3.upload_file(result_path, s3_bucket, out_key)
+        print("Finished", out_key)
+
+
 if __name__ == "__main__":
-    print("gradio version", gr.__version__)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--serve-mode", action="store_true", help="Run headless worker mode")
+    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL"), help="Redis URL")
+    parser.add_argument("--s3-bucket", default=os.getenv("S3_BUCKET"), help="S3 bucket name")
+    args = parser.parse_args()
+
     if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    
-    worker_thread = threading.Thread(target=background_worker, daemon=True)
-    worker_thread.start()
-    demo.launch(server_name="0.0.0.0", server_port=7860)
-    print("exit")
+
+    if args.serve_mode:
+        run_worker(args.redis_url, args.s3_bucket)
+    else:
+        launch_ui(args.redis_url, args.s3_bucket)
