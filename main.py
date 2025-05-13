@@ -9,6 +9,7 @@ os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 import gradio as gr
+from gradio import Gallery, Slider
 import subprocess
 import tempfile
 import shutil
@@ -24,11 +25,42 @@ import asyncio
 import subprocess
 import requests
 import random
+import glob
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
-from PIL import Image
+from PIL import Image as PILImage
 
 import torch.nn.functional as F
 import numpy as np
+
+# --- SceneDetect imports and helpers ---
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
+
+def detect_scenes(path, threshold=30.0):
+    video_manager = VideoManager([path])
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector(threshold))
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager)
+    scenes = scene_manager.get_scene_list()
+    video_manager.release()
+    return [(scene[0].get_seconds(), scene[1].get_seconds()) for scene in scenes]
+
+def make_segments(scenes, target_sec=180.0):
+    if not scenes:
+        return [(0.0, None)]
+    segments = []
+    cur_start = scenes[0][0]
+    acc = 0.0
+    for start, end in scenes:
+        dur = end - start
+        if acc + dur > target_sec and acc > 0:
+            segments.append((cur_start, start))
+            cur_start = start
+            acc = 0.0
+        acc += dur
+    segments.append((cur_start, scenes[-1][1]))
+    return segments
 
 from matanyone.model.matanyone import MatAnyone
 from matanyone.inference.inference_core import InferenceCore
@@ -37,6 +69,25 @@ from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
 from filebrowser_client import FilebrowserClient
+def generate_sample_frames(video_file, projection, num_samples):
+    # Compute video info
+    info = FFmpegStream.get_video_info(video_file.name)
+    fps = info.fps
+    length = info.length
+    # Compute timestamps evenly across the video
+    total_seconds = length / fps
+    interval = total_seconds / (num_samples + 1)
+    frames = []
+    filter_complex = None
+    if projection == "eq":
+        filter_complex = "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
+    for i in range(num_samples):
+        t = interval * (i + 1)
+        frame = FFmpegStream.get_frame(video_file.name, int(t * fps), filter_complex)
+        # Convert BGR numpy to PIL RGB
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(PILImage.fromarray(img))
+    return frames
 
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
@@ -295,40 +346,50 @@ def add_job(video, projection, maskL, maskR, crf, erode):
 
     if video is None:
         raise gr.Error("video missing", duration=3)
-
-    if maskL is None: 
+    if maskL is None:
         raise gr.Error("maskL not set", duration=3)
-
     if maskR is None:
         raise gr.Error("maskR not set", duration=3)
-
     if Image.fromarray(maskL).convert("L").getextrema() == (0, 0):
         raise gr.Error("maskL is empty", duration=3)
-
     if Image.fromarray(maskR).convert("L").getextrema() == (0, 0):
         raise gr.Error("maskR is empty", duration=3)
 
-    job_id += 1
-    print("Add job", job_id)
-
+    print("Add job", job_id + 1)
     ts = str(int(time.time()))
-
     dest = '/jobs/' + ts + os.path.basename(video.name)
     shutil.move(video.name, dest)
 
-    job_data = {
-        'id': job_id,
-        'video': dest,
-        'projection': projection,
-        'crf': crf,
-        'maskL': Image.fromarray(maskL).convert('L'),
-        'maskR': Image.fromarray(maskR).convert('L'),
-        'erode': erode
-    }
-
-    with open(f"/jobs/{ts}.pkl", "wb") as f:
-        pickle.dump(job_data, f)
-
+    # Scene-based segmentation into ~3-minute chunks
+    _, file_extension = os.path.splitext(dest)
+    scenes = detect_scenes(dest)
+    segments = make_segments(scenes, target_sec=180.0)
+    segment_files = []
+    for idx, (s, e) in enumerate(segments):
+        seg_path = dest.replace(file_extension, f'_seg_{idx:03d}{file_extension}')
+        cmd = ['ffmpeg', '-i', dest, '-ss', str(s)]
+        if e is not None:
+            cmd += ['-to', str(e)]
+        cmd += ['-c', 'copy', seg_path]
+        subprocess.run(cmd, check=True)
+        segment_files.append(seg_path)
+    # Remove the original full video file
+    os.remove(dest)
+    # Enqueue each segment as its own job
+    for seg_path in segment_files:
+        job_id += 1
+        job_data = {
+            'id': job_id,
+            'video': seg_path,
+            'projection': projection,
+            'crf': crf,
+            'maskL': Image.fromarray(maskL).convert('L'),
+            'maskR': Image.fromarray(maskR).convert('L'),
+            'erode': erode
+        }
+        with open(f"/jobs/{os.path.basename(seg_path)}.pkl", "wb") as f:
+            pickle.dump(job_data, f)
+    # Skip the old single-job creation below
     return None, None, None, None, None, None, None, None, None, None, None, None, None
 
 def status_text():
@@ -577,6 +638,12 @@ with gr.Blocks() as demo:
         with gr.Row():
             framePreviewL = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
             framePreviewR = gr.Image(value=None, type='numpy', format='png', image_mode='RGB')
+
+    gr.Markdown("## Stage 2.5 - Sample More Frames")
+    num_samples_slider = gr.Slider(minimum=1, maximum=20, step=1, value=5, label="Number of Sample Frames")
+    sample_button = gr.Button("Generate Sample Frames")
+    samples_gallery = gr.Gallery(label="Sample Frames", show_label=False, elem_id="samples").style(grid=[5], height="auto")
+    sample_button.click(fn=generate_sample_frames, inputs=[input_video, projection_dropdown, num_samples_slider], outputs=samples_gallery)
 
     gr.Markdown("## Stage 3 - Generate Initial Mask")
     with gr.Tabs():

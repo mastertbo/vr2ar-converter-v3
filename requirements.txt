@@ -18,3 +18,4 @@ yapf
 transformers
 requests
 filebrowser-client
+scenedetect[opencv]
