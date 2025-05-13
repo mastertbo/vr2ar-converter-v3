@@ -81,6 +81,7 @@ def fix_mask2(mask):
 @torch.no_grad()
 def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     global WORKER_STATUS
+    start_time = time.time()
 
     _, mask_h = maskL.size
 
@@ -218,6 +219,13 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     os.remove(result_tmp_name)
 
     WORKER_STATUS = f"Convertion completed" 
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Processing time for {original_filename}: {elapsed_time:.2f} seconds")
+    # Write processing time to a log file
+    time_log_path = os.path.splitext(result_name)[0] + "_time.txt"
+    with open(time_log_path, "w") as f:
+        f.write(f"Processing time for {original_filename}: {elapsed_time:.2f} seconds\n")
     return result_name
 
 
@@ -256,6 +264,10 @@ def background_worker():
         result = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
         if result is not None:
             result_list.append(result)
+            # Add processing time log file to result_list, if it exists
+            time_log_path = os.path.splitext(result)[0] + "_time.txt"
+            if os.path.exists(time_log_path):
+                result_list.append(time_log_path)
             if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
                 WORKER_STATUS = "Uploading..."
                 if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
@@ -767,6 +779,18 @@ with gr.Blocks() as demo:
     timer5.tick(lambda: result_list, outputs=output_videos)
     demo.load(fn=status_text, outputs=status)
     demo.load(fn=lambda: result_list, outputs=output_videos)
+
+    # --- Export environment section ---
+    gr.Markdown("## Export Environment")
+    export_button = gr.Button("Export Environment")
+    export_files = gr.File(value=[], label="Download Docker image & data")
+    def export_env():
+        image_tar = "/app/vr2ar-multigpu.tar"
+        data_tar = "/app/vr2ar-data.tar.gz"
+        subprocess.run(["docker", "save", "vr2ar-multigpu:latest", "-o", image_tar], check=True)
+        subprocess.run(["tar", "czvf", data_tar, "/app/results", "/app/corrections", "/app/checkpoints"], check=True)
+        return [image_tar, data_tar]
+    export_button.click(fn=export_env, inputs=None, outputs=export_files)
 
 
 if __name__ == "__main__":
