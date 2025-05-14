@@ -18,3 +18,10 @@ yapf
 transformers
 requests
 filebrowser-client
+redis
+boto3
+io
+json
+asyncio
+glob
+pickle
