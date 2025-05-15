@@ -42,6 +42,7 @@ from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
 from filebrowser_client import FilebrowserClient
+import multiprocessing as mp
 
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
@@ -87,12 +88,16 @@ def fix_mask2(mask):
 
 # --- Multi-GPU segment worker function, moved to module level ---
 def run_segment_worker(gpu_id, start, end, output_queue, frames, maskL, maskR, mask_h, has_cuda, erode):
-    device = torch.device(f"cuda:{gpu_id}" if has_cuda else "cpu")
+    # Explicitly set device context
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
     modelL = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
     modelR = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
 
     processorL = InferenceCore(modelL, cfg=modelL.cfg)
     processorR = InferenceCore(modelR, cfg=modelR.cfg)
+
 
     objects = [1]
     for idx in range(start, end):
@@ -775,7 +780,7 @@ def launch_ui(redis_url, s3_bucket):
     if not redis_url:
         worker_thread = threading.Thread(target=background_worker, daemon=True  )
         worker_thread.start()
-        demo.launch(server_port=7860)
+        demo.launch(server_name="0.0.0.0", server_port=7860)
         return
     r = redis.Redis.from_url(redis_url)
     s3 = boto3.client("s3")
@@ -846,6 +851,8 @@ def run_worker(redis_url, s3_bucket):
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True),
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--serve-mode", action="store_true", help="Run headless worker mode")
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL"), help="Redis URL")
