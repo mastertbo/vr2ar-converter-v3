@@ -813,7 +813,7 @@ def launch_ui(redis_url, s3_bucket):
         outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR,
                  maskSelectionL, maskSelectionR, mergedMaskL, mergedMaskR, previewMergedMaskL, previewMergedMaskR]
     )
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_port=7860)
 
 def run_worker(redis_url, s3_bucket):
     r = redis.Redis.from_url(redis_url)
