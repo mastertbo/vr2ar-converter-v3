@@ -83,6 +83,8 @@ def fix_mask2(mask):
 
     return mask
 
+
+# Multi-GPU process implementation
 @torch.no_grad()
 def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     global WORKER_STATUS
@@ -109,100 +111,91 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
         projection = "fisheye180"
 
     WORKER_STATUS = f"Load Models to create Masks"
-
-    current_frame = 0
-    objects = [1]
-
-    # adopted from published repo
-    WARMUP = 10
-    has_cuda = torch.torch.cuda.is_available()
-
-    ffmpeg = FFmpegStream(
-        video_path = video,
-        config = reader_config,
-        skip_frames = 0
-    )
+    has_cuda = torch.cuda.is_available()
+    num_gpus = torch.cuda.device_count() if has_cuda else 1
 
     result_tmp_name = file_name.replace(' ', '_') + "_" + str(projection).upper() + "_alpha_tmp" + file_extension 
     result_name = file_name.replace(' ', '_') + "_" + str(projection).upper() + "_alpha" + file_extension 
     writer = ArVideoWriter(result_tmp_name, video_info.fps, crf)
 
-    matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone1 = matanyone1.cuda()
-    matanyone1 = matanyone1.eval()
-    processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
-
-    matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone2 = matanyone2.cuda()
-    matanyone2 = matanyone2.eval()
-    processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
-
+    # Preload all frames
+    ffmpeg = FFmpegStream(video_path=video, config=reader_config)
+    frames = []
     while ffmpeg.isOpen():
-        img = ffmpeg.read()
-        if img is None:
+        frame = ffmpeg.read()
+        if frame is None:
             break
-        current_frame += 1
-
-        img_scaled = cv2.resize(img, (2*mask_h, mask_h))
-
-        _, width = img_scaled.shape[:2]
-        imgL = img_scaled[:, :int(width/2)]
-        imgR = img_scaled[:, int(width/2):]
-
-        imgLV = prepare_frame(imgL, has_cuda)
-        imgRV = prepare_frame(imgR, has_cuda)
-
-        if current_frame == 1:
-            imgLMask = maskL
-            imgRMask = maskR
-
-            output_prob_L = processor1.step(imgLV, imgLMask, objects=objects)
-            output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
-            
-            for i in range(WARMUP):
-                WORKER_STATUS = f"Warmup MatAnyone {i+1}/{WARMUP}"
-                output_prob_L = processor1.step(imgLV, first_frame_pred=True)
-                output_prob_R = processor2.step(imgRV, first_frame_pred=True)
-        else:
-            output_prob_L = processor1.step(imgLV)
-            output_prob_R = processor2.step(imgRV)
-
-        WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length}"
-        # print(WORKER_STATUS)
-
-        mask_output_L = processor1.output_prob_to_mask(output_prob_L)
-        mask_output_R = processor2.output_prob_to_mask(output_prob_R)
-
-        mask_output_L_pha = mask_output_L.unsqueeze(2).cpu().detach().numpy()
-        mask_output_R_pha = mask_output_R.unsqueeze(2).cpu().detach().numpy()
-
-        mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
-        mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
-
-        if erode:
-            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
-
-        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-        
-        writer.add_frame(img, combined_mask)
-
-        gc.collect()
-
-    del processor1
-    del processor2
-    del matanyone1
-    del matanyone2
-
-    if torch.torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
+        frames.append(frame)
     ffmpeg.stop()
-    writer.finalize()
 
-    total_frames = current_frame
+    total_frames = len(frames)
+
+    def run_segment_worker(gpu_id, start, end, output_queue):
+        device = torch.device(f"cuda:{gpu_id}" if has_cuda else "cpu")
+        modelL = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
+        modelR = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
+
+        processorL = InferenceCore(modelL, cfg=modelL.cfg)
+        processorR = InferenceCore(modelR, cfg=modelR.cfg)
+
+        objects = [1]
+        for idx in range(start, end):
+            frame = frames[idx]
+            img_scaled = cv2.resize(frame, (2*mask_h, mask_h))
+            _, width = img_scaled.shape[:2]
+            imgL = img_scaled[:, :width//2]
+            imgR = img_scaled[:, width//2:]
+
+            imgLV = prepare_frame(imgL, has_cuda).to(device)
+            imgRV = prepare_frame(imgR, has_cuda).to(device)
+
+            if idx == 0:
+                output_prob_L = processorL.step(imgLV, maskL.to(device), objects=objects)
+                output_prob_R = processorR.step(imgRV, maskR.to(device), objects=objects)
+                for _ in range(10):
+                    output_prob_L = processorL.step(imgLV, first_frame_pred=True)
+                    output_prob_R = processorR.step(imgRV, first_frame_pred=True)
+            else:
+                output_prob_L = processorL.step(imgLV)
+                output_prob_R = processorR.step(imgRV)
+
+            mask_output_L = processorL.output_prob_to_mask(output_prob_L).unsqueeze(2).cpu().numpy()
+            mask_output_R = processorR.output_prob_to_mask(output_prob_R).unsqueeze(2).cpu().numpy()
+            mask_output_L = (mask_output_L * 255).astype(np.uint8)
+            mask_output_R = (mask_output_R * 255).astype(np.uint8)
+            if erode:
+                mask_output_L = cv2.erode(mask_output_L, (3,3), iterations=1)
+                mask_output_R = cv2.erode(mask_output_R, (3,3), iterations=1)
+
+            combined_mask = cv2.hconcat([mask_output_L, mask_output_R])
+            output_queue.put((idx, frame, combined_mask))
+
+    import multiprocessing as mp
+    output_queue = mp.Queue()
+    chunk = (total_frames + num_gpus - 1) // num_gpus
+    processes = []
+    for i in range(num_gpus):
+        start = i * chunk
+        end = min((i + 1) * chunk, total_frames)
+        if start >= total_frames:
+            break
+        p = mp.Process(target=run_segment_worker, args=(i, start, end, output_queue))
+        p.start()
+        processes.append(p)
+
+    # Collect and write in order
+    result_frames = [None] * total_frames
+    for _ in range(total_frames):
+        idx, frame, mask = output_queue.get()
+        result_frames[idx] = (frame, mask)
+
+    for frame, mask in result_frames:
+        writer.add_frame(frame, mask)
+
+    for p in processes:
+        p.join()
+
+    writer.finalize()
     while not writer.is_finished():
         WORKER_STATUS = f"Encode Frame {writer.get_current_frame_number()}/{total_frames}"
         time.sleep(0.5)
@@ -219,9 +212,7 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
         "-map", "1:a:0",
         result_name
     ])
-
     os.remove(result_tmp_name)
-
     WORKER_STATUS = f"Convertion completed" 
     return result_name
 
