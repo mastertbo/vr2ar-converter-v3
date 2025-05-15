@@ -84,6 +84,49 @@ def fix_mask2(mask):
     return mask
 
 
+
+# --- Multi-GPU segment worker function, moved to module level ---
+def run_segment_worker(gpu_id, start, end, output_queue, frames, maskL, maskR, mask_h, has_cuda, erode):
+    device = torch.device(f"cuda:{gpu_id}" if has_cuda else "cpu")
+    modelL = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
+    modelR = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
+
+    processorL = InferenceCore(modelL, cfg=modelL.cfg)
+    processorR = InferenceCore(modelR, cfg=modelR.cfg)
+
+    objects = [1]
+    for idx in range(start, end):
+        frame = frames[idx]
+        img_scaled = cv2.resize(frame, (2*mask_h, mask_h))
+        _, width = img_scaled.shape[:2]
+        imgL = img_scaled[:, :width//2]
+        imgR = img_scaled[:, width//2:]
+
+        imgLV = prepare_frame(imgL, has_cuda).to(device)
+        imgRV = prepare_frame(imgR, has_cuda).to(device)
+
+        if idx == 0:
+            output_prob_L = processorL.step(imgLV, maskL.to(device), objects=objects)
+            output_prob_R = processorR.step(imgRV, maskR.to(device), objects=objects)
+            for _ in range(10):
+                output_prob_L = processorL.step(imgLV, first_frame_pred=True)
+                output_prob_R = processorR.step(imgRV, first_frame_pred=True)
+        else:
+            output_prob_L = processorL.step(imgLV)
+            output_prob_R = processorR.step(imgRV)
+
+        mask_output_L = processorL.output_prob_to_mask(output_prob_L).unsqueeze(2).cpu().numpy()
+        mask_output_R = processorR.output_prob_to_mask(output_prob_R).unsqueeze(2).cpu().numpy()
+        mask_output_L = (mask_output_L * 255).astype(np.uint8)
+        mask_output_R = (mask_output_R * 255).astype(np.uint8)
+        if erode:
+            mask_output_L = cv2.erode(mask_output_L, (3,3), iterations=1)
+            mask_output_R = cv2.erode(mask_output_R, (3,3), iterations=1)
+
+        combined_mask = cv2.hconcat([mask_output_L, mask_output_R])
+        output_queue.put((idx, frame, combined_mask))
+
+
 # Multi-GPU process implementation
 @torch.no_grad()
 def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
@@ -130,46 +173,6 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
 
     total_frames = len(frames)
 
-    def run_segment_worker(gpu_id, start, end, output_queue):
-        device = torch.device(f"cuda:{gpu_id}" if has_cuda else "cpu")
-        modelL = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
-        modelR = MatAnyone.from_pretrained("PeiqingYang/MatAnyone").to(device).eval()
-
-        processorL = InferenceCore(modelL, cfg=modelL.cfg)
-        processorR = InferenceCore(modelR, cfg=modelR.cfg)
-
-        objects = [1]
-        for idx in range(start, end):
-            frame = frames[idx]
-            img_scaled = cv2.resize(frame, (2*mask_h, mask_h))
-            _, width = img_scaled.shape[:2]
-            imgL = img_scaled[:, :width//2]
-            imgR = img_scaled[:, width//2:]
-
-            imgLV = prepare_frame(imgL, has_cuda).to(device)
-            imgRV = prepare_frame(imgR, has_cuda).to(device)
-
-            if idx == 0:
-                output_prob_L = processorL.step(imgLV, maskL.to(device), objects=objects)
-                output_prob_R = processorR.step(imgRV, maskR.to(device), objects=objects)
-                for _ in range(10):
-                    output_prob_L = processorL.step(imgLV, first_frame_pred=True)
-                    output_prob_R = processorR.step(imgRV, first_frame_pred=True)
-            else:
-                output_prob_L = processorL.step(imgLV)
-                output_prob_R = processorR.step(imgRV)
-
-            mask_output_L = processorL.output_prob_to_mask(output_prob_L).unsqueeze(2).cpu().numpy()
-            mask_output_R = processorR.output_prob_to_mask(output_prob_R).unsqueeze(2).cpu().numpy()
-            mask_output_L = (mask_output_L * 255).astype(np.uint8)
-            mask_output_R = (mask_output_R * 255).astype(np.uint8)
-            if erode:
-                mask_output_L = cv2.erode(mask_output_L, (3,3), iterations=1)
-                mask_output_R = cv2.erode(mask_output_R, (3,3), iterations=1)
-
-            combined_mask = cv2.hconcat([mask_output_L, mask_output_R])
-            output_queue.put((idx, frame, combined_mask))
-
     import multiprocessing as mp
     output_queue = mp.Queue()
     chunk = (total_frames + num_gpus - 1) // num_gpus
@@ -179,7 +182,8 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
         end = min((i + 1) * chunk, total_frames)
         if start >= total_frames:
             break
-        p = mp.Process(target=run_segment_worker, args=(i, start, end, output_queue))
+        # NOTE: updated signature to pass all needed arguments to run_segment_worker
+        p = mp.Process(target=run_segment_worker, args=(i, start, end, output_queue, frames, maskL, maskR, mask_h, has_cuda, erode))
         p.start()
         processes.append(p)
 
@@ -316,7 +320,7 @@ def add_job(video, projection, maskL, maskR, crf, erode):
     return None, None, None, None, None, None, None, None, None, None, None, None, None
 
 def status_text():
-    pending_jobs = len([x for x in glob.glob("/jobs/*.pkl")])
+    pending_jobs = len([x for x in glob.glob("jobs/*.pkl")])
     return "Worker Status: " + WORKER_STATUS + "\n" \
         + f"Pending Jobs: {pending_jobs}"
 
@@ -769,6 +773,8 @@ with gr.Blocks() as demo:
 # --- Distributed/queue mode functions ---
 def launch_ui(redis_url, s3_bucket):
     if not redis_url:
+        worker_thread = threading.Thread(target=background_worker, daemon=True  )
+        worker_thread.start()
         demo.launch(server_port=7860)
         return
     r = redis.Redis.from_url(redis_url)
