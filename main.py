@@ -777,6 +777,9 @@ with gr.Blocks() as demo:
 
 # --- Distributed/queue mode functions ---
 def launch_ui(redis_url, s3_bucket):
+    if not redis_url:
+        demo.launch(server_port=7860)
+        return
     r = redis.Redis.from_url(redis_url)
     s3 = boto3.client("s3")
     def enqueue_job(video, projection, maskL, maskR, crf, erode):
