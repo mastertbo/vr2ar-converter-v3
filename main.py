@@ -306,7 +306,9 @@ def add_job(video, projection, maskL, maskR, crf, erode):
 
     ts = str(int(time.time()))
 
-    dest = '/jobs/' + ts + os.path.basename(video.name)
+    jobs_dir = os.path.join(os.getcwd(), "jobs")
+    os.makedirs(jobs_dir, exist_ok=True)
+    dest = os.path.join(jobs_dir, ts + os.path.basename(video.name))
     shutil.move(video.name, dest)
 
     job_data = {
