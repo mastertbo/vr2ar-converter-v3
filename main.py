@@ -237,14 +237,13 @@ def background_worker():
                 time.sleep(30)
                 continue
 
-        pkl = [x for x in glob.glob("/jobs/*.pkl")]
-
+        pkl = [x for x in glob.glob("jobs/*.pkl")]
         if len(pkl) == 0:
             time.sleep(2)
             continue
 
         pkl = sorted(pkl)[0]
-        time.sleep(2) # ensure file is fully written
+        time.sleep(2)  # ensure file is fully written
         with open(pkl, 'rb') as f:
             job = pickle.load(f)
 
@@ -267,7 +266,6 @@ def background_worker():
                     concurrent=1,
                 )
                 asyncio.run(couroutine)
-
 
         os.remove(job['video'])
         os.remove(pkl)
@@ -296,9 +294,9 @@ def add_job(video, projection, maskL, maskR, crf, erode):
     print("Add job", job_id)
 
     ts = str(int(time.time()))
-
     jobs_dir = os.path.join(os.getcwd(), "jobs")
     os.makedirs(jobs_dir, exist_ok=True)
+
     dest = os.path.join(jobs_dir, ts + os.path.basename(video.name))
     shutil.move(video.name, dest)
 
@@ -312,7 +310,7 @@ def add_job(video, projection, maskL, maskR, crf, erode):
         'erode': erode
     }
 
-    with open(f"/jobs/{ts}.pkl", "wb") as f:
+    with open(os.path.join(jobs_dir, f"{ts}.pkl"), "wb") as f:
         pickle.dump(job_data, f)
 
     return None, None, None, None, None, None, None, None, None, None, None, None, None
