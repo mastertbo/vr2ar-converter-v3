@@ -296,8 +296,11 @@ def sam_segment_points(sam_model, image, prompt_points):
 
 class GroundingDinoSAM2Segment:
     def __init__(self, gpu_id=0):
-        # Set the torch device to the specific GPU
-        torch.cuda.set_device(gpu_id)
+        # Set the torch device to the specific GPU if available and valid
+        if torch.cuda.is_available() and torch.cuda.device_count() > gpu_id:
+            torch.cuda.set_device(gpu_id)
+        else:
+            print(f"CUDA not available or GPU index {gpu_id} is out of range. Running on CPU.")
         self.grounding_dino_model = load_groundingdino_model("GroundingDINO_SwinB (938MB)")
         self.sam_model = load_sam_model("sam2_1_hiera_large.pt")
 
