@@ -68,10 +68,8 @@ groundingdino_model_list = {
 
 def get_bert_base_uncased_model_path():
     bert_model_base = os.path.join("model", "bert-base-uncased")
-    if glob.glob(
-        os.path.join(bert_model_base, "**/model.safetensors"), recursive=True
-    ):
-        print("grounding-dino is using model/bert-base-uncased")
+    if os.path.isdir(bert_model_base):
+        print("grounding-dino is using local model/bert-base-uncased")
         return bert_model_base
     return "bert-base-uncased"
 
