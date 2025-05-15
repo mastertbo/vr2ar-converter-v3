@@ -91,7 +91,7 @@ def load_sam_model(model_name):
     initialize(config_path=config_path)
     model_cfg = f"{model_type}.yaml"
 
-    sam_device = "cuda" if torch.cuda.is_available() else "cpu"
+    sam_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if torch.cuda.is_available() else "cpu")
     sam = build_sam2(model_cfg, sam2_checkpoint_path, device=sam_device)
     sam.model_name = model_file_name
     return sam
@@ -103,7 +103,7 @@ def get_local_filepath(url, dirname, local_file_name=None):
         local_file_name = os.path.basename(parsed_url.path)
 
     destination = os.path.join("model", local_file_name)
-    if destination:
+    if os.path.exists(destination):
         logger.warn(f"using extra model: {destination}")
         return destination
 
@@ -114,7 +114,13 @@ def get_local_filepath(url, dirname, local_file_name=None):
     destination = os.path.join(folder, local_file_name)
     if not os.path.exists(destination):
         logger.warn(f"downloading {url} to {destination}")
-        download_url_to_file(url, destination)
+        # Attempt to download if not already present
+        try:
+            download_url_to_file(url, destination)
+            logger.warn(f"Downloaded {url} to {destination}")
+        except Exception as e:
+            logger.error(f"Failed to download {url} to {destination}: {str(e)}")
+            raise FileNotFoundError(f"Model file not found and download failed: {destination}")
     return destination
 
 
@@ -139,7 +145,7 @@ def load_groundingdino_model(model_name):
     dino.load_state_dict(
         local_groundingdino_clean_state_dict(checkpoint["model"]), strict=False
     )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     dino.to(device=device)
     dino.eval()
     return dino
@@ -289,7 +295,9 @@ def sam_segment_points(sam_model, image, prompt_points):
 
 
 class GroundingDinoSAM2Segment:
-    def __init__(self):
+    def __init__(self, gpu_id=0):
+        # Set the torch device to the specific GPU
+        torch.cuda.set_device(gpu_id)
         self.grounding_dino_model = load_groundingdino_model("GroundingDINO_SwinB (938MB)")
         self.sam_model = load_sam_model("sam2_1_hiera_large.pt")
 
@@ -326,3 +334,66 @@ class SAM2PointSegment:
         ).convert("RGBA")
         return sam_segment_points(self.sam_model, item, prompt_points)
 
+
+
+# --- Parallel Video Segmentation ---
+import threading
+from queue import Queue
+
+def parallel_segment_video(frames, threshold, prompt="top person"):
+    """
+    Parallel segmentation of a list of frames using all available GPUs.
+    Splits frames into N chunks, where N = torch.cuda.device_count().
+    Each GPU processes its chunk in a separate thread.
+    Results are collected into a shared output queue.
+    """
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 1:
+        raise RuntimeError("No CUDA devices available for parallel segmentation.")
+    n = len(frames)
+    # Split frames into N chunks as evenly as possible
+    chunk_sizes = [(n // num_gpus) + (1 if x < n % num_gpus else 0) for x in range(num_gpus)]
+    chunks = []
+    start = 0
+    for size in chunk_sizes:
+        end = start + size
+        chunks.append(frames[start:end])
+        start = end
+
+    output_queue = Queue()
+    threads = []
+
+    def worker(gpu_id, chunk, threshold, prompt, output_queue):
+        segmenter = GroundingDinoSAM2Segment(gpu_id=gpu_id)
+        result = segmenter.predict(chunk, threshold, prompt)
+        # Store (gpu_id, result, chunk indices) to preserve order if needed
+        output_queue.put((gpu_id, result, chunk))
+
+    for gpu_id, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        t = threading.Thread(target=worker, args=(gpu_id, chunk, threshold, prompt, output_queue))
+        t.start()
+        threads.append(t)
+
+    # Wait for threads to finish
+    for t in threads:
+        t.join()
+
+    # Gather results
+    results = []
+    while not output_queue.empty():
+        gpu_id, result, chunk = output_queue.get()
+        results.append((gpu_id, result, chunk))
+    # Optionally sort by gpu_id if output order matters
+    results.sort(key=lambda x: x[0])
+    # Flatten results (images, masks), combining all outputs
+    all_images = []
+    all_masks = []
+    for _, (images, masks), _ in results:
+        all_images.append(images)
+        all_masks.append(masks)
+    if all_images and all_masks:
+        return (torch.cat(all_images, dim=0), torch.cat(all_masks, dim=0))
+    else:
+        return None
