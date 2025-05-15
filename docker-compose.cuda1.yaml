@@ -2,7 +2,7 @@ services:
   vr2ar:
     # build:
     #  context: .
-    image: "docker.io/milkjeff/vr2arconverterv3:latest"
+    image: "docker.io/mastertbo/vr2arconverterv3:multigpu"
     deploy:
       resources:
         reservations:
