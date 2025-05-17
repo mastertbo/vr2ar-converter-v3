@@ -42,7 +42,7 @@ WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
 SECONDS = 10
 WARMUP = 4
-JOB_VERSION = 1
+JOB_VERSION = 2
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -82,7 +82,7 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(video, projection, masks, crf = 16, erode = False):
+def process(video, projection, masks, crf = 16, erode = False, force_init_mask=False):
     global WORKER_STATUS
 
     maskIdx = 0
@@ -156,7 +156,14 @@ def process(video, projection, masks, crf = 16, erode = False):
         imgLV = prepare_frame(imgL, has_cuda)
         imgRV = prepare_frame(imgR, has_cuda)
 
+        frame_match = False
+        if force_init_mask and current_frame == 1:
+            frame_match = True
         if maskIdx < len(masks) and np.array_equal(masks[maskIdx]['frameL'], imgL) and np.array_equal(masks[maskIdx]['frameR'], imgR):
+            frame_match = True
+
+        if frame_match:
+            print("match at", current_frame)
             imgLMask = fix_mask2(masks[maskIdx]['maskL'])
             imgRMask = fix_mask2(masks[maskIdx]['maskR'])
             maskIdx += 1
@@ -194,6 +201,9 @@ def process(video, projection, masks, crf = 16, erode = False):
         writer.add_frame(img, combined_mask)
 
         gc.collect()
+
+    if maskIdx < len(masks):
+        print("ERROR: not all frames found in video!")
 
     del processor1
     del processor2
@@ -263,7 +273,7 @@ def background_worker():
 
         if job['version'] == JOB_VERSION:
             print("Start job")
-            result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'])
+            result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'])
             if result is not None:
                 result_list.append(result)
                 if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
@@ -288,7 +298,7 @@ def background_worker():
         time.sleep(1)
         WORKER_STATUS = "Idle"
 
-def add_job(video, projection, crf, erode):
+def add_job(video, projection, crf, erode, forceInitMask):
     if video is None:
         gr.Warning("Could not add Job: Video not found", duration=5)
         return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
@@ -328,7 +338,8 @@ def add_job(video, projection, crf, erode):
         'projection': projection,
         'crf': crf,
         'masks': masks,
-        'erode': erode
+        'erode': erode,
+        'forceInitMask': forceInitMask
     }
 
     with open(f"/jobs/{ts}.pkl", "wb") as f:
@@ -407,7 +418,10 @@ def get_selected(selected):
         return None, None, None, None, None, None
 
     frame_name = os.path.basename(selected['image']['path'])
-    frame = cv2.imread(selected['image']['path'].replace('previews', 'frames'))
+    if os.path.exists(os.path.join('frames', frame_name)):
+        frame = cv2.imread(os.path.join('frames', frame_name))
+    else:
+        return None, None, None, None, None, None
     
     width = 2*MASK_SIZE
 
@@ -881,10 +895,11 @@ with gr.Blocks() as demo:
         gr.Markdown("## Stage 4 - Add Job")
         crf_dropdown = gr.Dropdown(choices=[16,17,18,19,20,21,22], label="Encode CRF", value=16)
         erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=False, info="")
+        force_init_mask_checkbox = gr.Checkbox(label="Force Init Mask", value=False, info="")
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox],
+            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox, force_init_mask_checkbox],
             outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMask ]
         )
 

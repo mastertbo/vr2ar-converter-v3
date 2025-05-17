@@ -66,7 +66,7 @@ class FFmpegStream:
             config :dict,
             skip_frames :int = 0,
             start_frame :int = 0,
-            queue_size :int = 256,
+            queue_size :int = 16,
             watchdog_timeout_in_seconds :int = 30,
             log_queue_overrun :bool = False):
 
