@@ -121,15 +121,23 @@ class ArVideoWriter:
 
         def overlay_with_alpha(src, dst, x, y):
             h, w = src.shape[:2]
-            dst_y1, dst_y2 = y, y + h
-            dst_x1, dst_x2 = x, x + w
+            dst_h, dst_w = dst.shape[:2]
 
-            dst_crop = dst[dst_y1:dst_y2, dst_x1:dst_x2]
+            # Compute the region of interest in dst
+            crop_h = min(h, dst_h - y)
+            crop_w = min(w, dst_w - x)
+            if crop_h <= 0 or crop_w <= 0:
+                # No overlap
+                return
 
-            alpha = src[:, :, 3] / 255.0
+            # Crop src and alpha to fit inside dst
+            src_cropped = src[:crop_h, :crop_w]
+            dst_crop = dst[y:y+crop_h, x:x+crop_w]
+
+            alpha = src_cropped[:, :, 3] / 255.0
             alpha = alpha[..., np.newaxis]
 
-            dst_crop[:] = alpha * src[:, :, :3] + (1 - alpha) * dst_crop
+            dst_crop[:] = alpha * src_cropped[:, :, :3] + (1 - alpha) * dst_crop
 
         for overlay_img, (x, y) in overlay_params:
             overlay_with_alpha(overlay_img, result, x, y)

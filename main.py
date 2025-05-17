@@ -26,6 +26,7 @@ import requests
 import random
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
+from skimage.metrics import structural_similarity as ssim
 
 import torch.nn.functional as F
 import numpy as np
@@ -159,8 +160,13 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
         frame_match = False
         if force_init_mask and current_frame == 1:
             frame_match = True
-        if maskIdx < len(masks) and np.array_equal(masks[maskIdx]['frameL'], imgL) and np.array_equal(masks[maskIdx]['frameR'], imgR):
-            frame_match = True
+
+        if maskIdx < len(masks):
+            ssim1 = ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY))
+            ssim2 = ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY))
+            print("ssim", ssim1, ssim2)
+            if ssim1 > 0.99 and ssim2 > 0.99:
+                frame_match = True
 
         if frame_match:
             print("match at", current_frame)
@@ -321,6 +327,8 @@ def add_job(video, projection, crf, erode, forceInitMask):
             'maskR': Image.open(os.path.join('masksR', f)).convert('L'),
             'frameL': frameL,
             'frameR': frameR,
+            'frameLGray': cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY),
+            'frameRGray': cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY),
         })
 
     if len(masks) == 0:
@@ -400,8 +408,8 @@ def extract_frames(video, projection):
         os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
         os.system(f"ffmpeg -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
     else:
-        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 frames/0000.png")
-        os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -start_number 1 frames/%04d.png")
+        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -pix_fmt bgr24 frames/0000.png")
+        os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
     
     frames = [os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")]
 
