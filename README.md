@@ -14,3 +14,7 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
 3. Wait for complete of process.
 4. Download the result
 5. Combine your chunks back into on video
+
+## TODO
+
+- To improve the output we need to reverse track the masks for each provided mask and merge the output of these. Because MatAnyone Memory bank can only track features it have seen in the frames before. When the model has e.g. an tattoo which was not visible in the init frame we get holes in the predicted mask. When we use 2 init mask one for the  frame with the missing feature visible we could by feeding the frames in reverse also track such features. When we then merge both generated masks we should se a better output. The main problem is the required memory to hold these frames. An implementation requires further considerations...

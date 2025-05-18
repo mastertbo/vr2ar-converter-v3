@@ -162,11 +162,9 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
             frame_match = True
 
         if maskIdx < len(masks):
-            ssim1 = ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY))
-            ssim2 = ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY))
-            print("ssim", ssim1, ssim2)
-            if ssim1 > 0.99 and ssim2 > 0.99:
-                frame_match = True
+            if ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > 0.9:
+                if ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > 0.9:
+                    frame_match = True
 
         if frame_match:
             print("match at", current_frame)
@@ -406,10 +404,12 @@ def extract_frames(video, projection):
     if str(projection) == "eq":
         filter_complex = "split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
         os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
-        os.system(f"ffmpeg -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
+        if SECONDS > 0:
+            os.system(f"ffmpeg -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
     else:
         os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -pix_fmt bgr24 frames/0000.png")
-        os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
+        if SECONDS > 0:
+            os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
     
     frames = [os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")]
 
@@ -627,6 +627,10 @@ def set_mask_size(x):
     global MASK_SIZE
     MASK_SIZE = int(x)
 
+def set_extract_frames_step(x):
+    global SECONDS
+    SECONDS = int(x)
+
 def generate_example(maskL, maskR):
     frameL = current_origin_frame['L'].frame_data
     frameR = current_origin_frame['R'].frame_data
@@ -684,9 +688,20 @@ with gr.Blocks() as demo:
             step=1,
             value=MASK_SIZE
         )
+        extract_frames_step = gr.Number(
+            label="Extract frames every x seconds",
+            minimum=0,
+            maximum=600,
+            step=1,
+            value=SECONDS
+        )
         mask_size.change(
             fn=set_mask_size,
             inputs=mask_size
+        )
+        extract_frames_step.change(
+            fn=set_extract_frames_step,
+            inputs=extract_frames_step
         )
 
 
