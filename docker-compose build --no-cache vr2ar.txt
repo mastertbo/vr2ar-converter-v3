@@ -1,0 +1,17 @@
+docker-compose build --no-cache vr2ar
+docker-compose up -d
+
+
+docker-compose -f docker-compose.cuda1.yaml build 
+
+docker run --gpus all -p 7860:7860 -v docker.io/mastertbo/vr2ar-converter-v3:multigpu 
+
+docker run --gpus all -it \
+  -v "$(pwd)":/app \
+  -w /app \
+  --network host \
+  --entrypoint bash \
+  vr2arconverterv3:latest
+
+
+  docker build --cache-from docker.io/mastertbo/vr2ar-converter-v3:multigpu -t docker.io/mastertbo/vr2ar-converter-v3:multigpu
