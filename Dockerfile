@@ -10,6 +10,17 @@ RUN apt-get install git -y
 RUN apt-get install curl -y
 RUN apt-get install wget -y
 RUN apt-get install ffmpeg -y
+# Install curl and gnupg if not already installed
+RUN apt-get update && apt-get install -y curl gnupg2
+
+# Add Tailscale GPG key
+RUN curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+# Add Tailscale repo (with signed-by reference)
+RUN echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | tee /etc/apt/sources.list.d/tailscale.list
+
+# Install Tailscale
+RUN apt-get update && apt-get install -y tailscale
 
 RUN mkdir -p /app/model
 RUN mkdir -p /app/sam2
