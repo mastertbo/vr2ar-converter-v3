@@ -18,3 +18,4 @@ yapf
 transformers
 requests
 filebrowser-client
+GPUtil>=1.4.0

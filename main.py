@@ -8,6 +8,18 @@ os.environ["DO_NOT_TRACK"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
+import multiprocessing, GPUtil, logging, io, datetime
+multiprocessing.set_start_method("spawn", force=True)
+
+_log_stream = io.StringIO()
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s – %(message)s',
+    handlers=[logging.StreamHandler(_log_stream),
+              logging.FileHandler("pipeline.log", mode="a")]
+)
+logger = logging.getLogger("VR2AR")
+
 import gradio as gr
 import subprocess
 import tempfile
@@ -42,6 +54,11 @@ from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
 from filebrowser_client import FilebrowserClient
+
+def log_status(msg: str):
+    global WORKER_STATUS
+    WORKER_STATUS = msg
+    logger.info(msg)
 
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
@@ -84,8 +101,10 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
+def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False, gpu_id: int = 0):
     global WORKER_STATUS
+    torch.cuda.set_device(gpu_id)
+    log_status(f"GPU{gpu_id}: starting job {job_id}")
 
     _, mask_h = maskL.size
 
@@ -129,13 +148,13 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
 
     matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
     if torch.torch.cuda.is_available():
-        matanyone1 = matanyone1.cuda()
+        matanyone1 = matanyone1.to(f"cuda:{gpu_id}")
     matanyone1 = matanyone1.eval()
     processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
 
     matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
     if torch.torch.cuda.is_available():
-        matanyone2 = matanyone2.cuda()
+        matanyone2 = matanyone2.to(f"cuda:{gpu_id}")
     matanyone2 = matanyone2.eval()
     processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
 
@@ -230,59 +249,54 @@ job_id = 0
 result_list = []
 
 def background_worker():
-    global file_list
-    global WORKER_STATUS
-    surplus_url = os.environ.get('JOB_SURPLUS_CHECK_URL')
+    """
+    Master loop:
+      • Spawns one worker per GPU
+      • Feeds /jobs/*.pkl into a task queue
+      • Collects finished paths or error strings
+    """
+    import gpu_worker
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        logger.error("No GPUs detected – quitting background thread")
+        return
+
+    task_q = multiprocessing.Queue()
+    done_q = multiprocessing.Queue()
+
+    # spawn workers
+    for gid in range(num_gpus):
+        p = multiprocessing.Process(
+            target=gpu_worker.worker_main,
+            args=(gid, task_q, done_q),
+            daemon=True
+        )
+        p.start()
+        logger.info(f"Spawned GPU worker {gid}")
+
     while True:
-        if surplus_url:
-            try:
-                start_job = "True" in str(requests.get(surplus_url).json())
-            except Exception as ex:
-                start_job = False
-                print(ex)
-
-            if not start_job:
-                WORKER_STATUS = "Wait for surplus"
-                time.sleep(30)
-                continue
-
-        pkl = [x for x in glob.glob("/jobs/*.pkl")]
-
-        if len(pkl) == 0:
+        pkl_jobs = sorted(glob.glob("/jobs/*.pkl"))
+        if not pkl_jobs:
+            WORKER_STATUS = "Idle"
             time.sleep(2)
             continue
 
-        pkl = sorted(pkl)[0]
-        time.sleep(2) # ensure file is fully written
-        with open(pkl, 'rb') as f:
+        pkl = pkl_jobs[0]
+        time.sleep(2)  # ensure writer finished
+        with open(pkl, "rb") as f:
             job = pickle.load(f)
 
-        print("Start job", job['id'])
-        result = process(job['id'], job['video'], job['projection'], job['maskL'], job['maskR'], job['crf'], job['erode'])
-        if result is not None:
+        logger.info(f"Dispatch job {job['id']}")
+        task_q.put(job)
+
+        result = done_q.get()
+        if isinstance(result, str) and result.startswith("ERROR:"):
+            logger.error(result)
+        else:
             result_list.append(result)
-            if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
-                WORKER_STATUS = "Uploading..."
-                if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
-                    client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
-                else:
-                    client = FilebrowserClient(filebrowser_host, insecure=True)
 
-                asyncio.run(client.connect())
-                couroutine = client.upload(
-                    local_path=result,
-                    remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
-                    override=False,
-                    concurrent=1,
-                )
-                asyncio.run(couroutine)
-
-
-        os.remove(job['video'])
+        os.remove(job["video"])
         os.remove(pkl)
-        time.sleep(1)
-        WORKER_STATUS = "Idle"
-
 def add_job(video, projection, maskL, maskR, crf, erode):
     global job_id
 
@@ -757,6 +771,7 @@ with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("## Job Results")
         status = gr.Textbox(label="Status", lines=2)
+        logs_box = gr.Textbox(label="Live Logs", lines=15, interactive=False)
         output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
         restart_button = gr.Button("CLEANUP AND RESTART".upper())
         restart_button.click(
@@ -770,6 +785,9 @@ with gr.Blocks() as demo:
     timer5 = gr.Timer(5, active=True)
     timer1.tick(status_text, outputs=status)
     timer5.tick(lambda: result_list, outputs=output_videos)
+    def _tail(chars: int = 6000):
+        return _log_stream.getvalue()[-chars:]
+    timer5.tick(fn=_tail, outputs=logs_box)
     demo.load(fn=status_text, outputs=status)
     demo.load(fn=lambda: result_list, outputs=output_videos)
 
