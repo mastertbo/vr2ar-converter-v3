@@ -17,6 +17,8 @@ from threading import Timer
 
 class Watchdog(Exception):
     def __init__(self, timeout_in_seconds, userHandler=None):
+        if timeout_in_seconds == 0:
+            timeout_in_seconds = 3600 * 24 * 356
         self.timeout = timeout_in_seconds
         self.handler = userHandler if userHandler is not None else self.defaultHandler
         self.timer = Timer(self.timeout, self.handler)
