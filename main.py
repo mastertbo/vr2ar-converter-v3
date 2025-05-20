@@ -45,6 +45,7 @@ MASK_SIZE = 1440
 SECONDS = 10
 WARMUP = 4
 JOB_VERSION = 3
+SSIM_THRESHOLD = 0.985
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -177,8 +178,8 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
             frame_match = True
 
         if maskIdx < len(masks):
-            if ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > 0.9:
-                if ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > 0.9:
+            if ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > SSIM_THRESHOLD:
+                if ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > SSIM_THRESHOLD:
                     frame_match = True
 
         if frame_match:
@@ -350,8 +351,12 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
             frame_match = True
 
         if maskIdx < len(masks):
-            if ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > 0.9:
-                if ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > 0.9:
+            s1 = ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY))
+            print("ssim1", s1)
+            if s1 > SSIM_THRESHOLD:
+                s2 = ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY))
+                print("ssim2", s2)
+                if s2 > SSIM_THRESHOLD:
                     frame_match = True
 
         imgLV = prepare_frame(imgL, has_cuda)
@@ -583,13 +588,19 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
         frameL = frame[:, :int(width/2)]
         frameR = frame[:, int(width/2):]
 
+        maskL = Image.open(os.path.join('masksL', f)).convert('L')
+        maskR = Image.open(os.path.join('masksR', f)).convert('L')
+
+        grayL = cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY)
+        grayR = cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY)
+
         masks.append({
-            'maskL': Image.open(os.path.join('masksL', f)).convert('L'),
-            'maskR': Image.open(os.path.join('masksR', f)).convert('L'),
+            'maskL': maskL,
+            'maskR': maskR,
             'frameL': frameL,
             'frameR': frameR,
-            'frameLGray': cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY),
-            'frameRGray': cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY),
+            'frameLGray': grayL,
+            'frameRGray': grayR
         })
 
     if len(masks) == 0:
