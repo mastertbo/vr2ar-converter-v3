@@ -46,6 +46,7 @@ SECONDS = 10
 WARMUP = 4
 JOB_VERSION = 3
 SSIM_THRESHOLD = 0.985
+DEBUG = False
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -352,7 +353,8 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 
         if maskIdx < len(masks):
             s1 = ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY))
-            print("ssim1", s1)
+            if DEBUG:
+                print("ssim1", s1)
             if s1 > SSIM_THRESHOLD:
                 s2 = ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY))
                 print("ssim2", s2)
@@ -474,30 +476,59 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
     WORKER_STATUS = f"Create Mask Video..."
     scale = video_info.height / mask_h * 0.4
 
-    if "eq" == projection:
-        fc = f"[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]; [1]scale=iw*{scale}:-1[alpha];[2][alpha]scale2ref[mask][alpha];[alpha][mask]alphamerge,split=2[masked_alpha1][masked_alpha2]; [masked_alpha1]crop=iw/2:ih:0:0,split=2[masked_alpha_l1][masked_alpha_l2]; [masked_alpha2]crop=iw/2:ih:iw/2:0,split=4[masked_alpha_r1][masked_alpha_r2][masked_alpha_r3][masked_alpha_r4]; [v][masked_alpha_l1]overlay=W*0.5-w*0.5:-0.5*h[out_lt];[out_lt][masked_alpha_l2]overlay=W*0.5-w*0.5:H-0.5*h[out_tb]; [out_tb][masked_alpha_r1]overlay=0-w*0.5:-0.5*h[out_l_lt];[out_l_lt][masked_alpha_r2]overlay=0-w*0.5:H-0.5*h[out_tb_ltb]; [out_tb_ltb][masked_alpha_r3]overlay=W-w*0.5:-0.5*h[out_r_lt];[out_r_lt][masked_alpha_r4]overlay=W-w*0.5:H-0.5*h[out_final]"
-    else:
-        fc = f"[1]scale=iw*{scale}:-1[alpha];[2][alpha]scale2ref[mask][alpha];[alpha][mask]alphamerge,split=2[masked_alpha1][masked_alpha2]; [masked_alpha1]crop=iw/2:ih:0:0,split=2[masked_alpha_l1][masked_alpha_l2]; [masked_alpha2]crop=iw/2:ih:iw/2:0,split=4[masked_alpha_r1][masked_alpha_r2][masked_alpha_r3][masked_alpha_r4]; [0][masked_alpha_l1]overlay=W*0.5-w*0.5:-0.5*h[out_lt];[out_lt][masked_alpha_l2]overlay=W*0.5-w*0.5:H-0.5*h[out_tb]; [out_tb][masked_alpha_r1]overlay=0-w*0.5:-0.5*h[out_l_lt];[out_l_lt][masked_alpha_r2]overlay=0-w*0.5:H-0.5*h[out_tb_ltb]; [out_tb_ltb][masked_alpha_r3]overlay=W-w*0.5:-0.5*h[out_r_lt];[out_r_lt][masked_alpha_r4]overlay=W-w*0.5:H-0.5*h[out_final]"
+    fc2 = f'"[1]scale=iw*{scale}:-1[alpha];[2][alpha]scale2ref[mask][alpha];[alpha][mask]alphamerge,split=2[masked_alpha1][masked_alpha2]; [masked_alpha1]crop=iw/2:ih:0:0,split=2[masked_alpha_l1][masked_alpha_l2]; [masked_alpha2]crop=iw/2:ih:iw/2:0,split=4[masked_alpha_r1][masked_alpha_r2][masked_alpha_r3][masked_alpha_r4]; [0][masked_alpha_l1]overlay=W*0.5-w*0.5:-0.5*h[out_lt];[out_lt][masked_alpha_l2]overlay=W*0.5-w*0.5:H-0.5*h[out_tb]; [out_tb][masked_alpha_r1]overlay=0-w*0.5:-0.5*h[out_l_lt];[out_l_lt][masked_alpha_r2]overlay=0-w*0.5:H-0.5*h[out_tb_ltb]; [out_tb_ltb][masked_alpha_r3]overlay=W-w*0.5:-0.5*h[out_r_lt];[out_r_lt][masked_alpha_r4]overlay=W-w*0.5:H-0.5*h"'
+
 
     cmd = [
         "ffmpeg",
-        "-i", video,
-        "-framerate", str(video_info.fps),
-        "-i", "process/masks/%06d.png",
+        '-loglevel', 'warning',
+        '-ss', FFmpegStream.frame_to_timestamp(0, video_info.fps),
+        '-hwaccel', 'auto',
+        '-i', "\""+str(video)+"\"",
+        '-f', 'image2pipe',
+        '-pix_fmt', 'bgr24',
+        '-vsync', 'passthrough',
+        '-vcodec', 'rawvideo',
+        '-an',
+        '-sn'
+    ]
+
+    if "eq" == projection:
+        cmd += [
+            "-filter_complex", "\"[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]\"",
+            "-map", "[v]"
+        ]
+
+    cmd += [
+        '-',
+        '|',
+        "ffmpeg",
+        '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{video_info.width}x{video_info.height}',
+        '-r', str(video_info.fps),
+        '-i', 'pipe:0',
+        '-r', str(video_info.fps),
+        "-i", "\"process/masks/%06d.png\"",
         "-i", "mask.png",
+        '-r', str(video_info.fps),
+        '-i', "\""+str(video)+"\"",
         "-filter_complex",
-        fc,
-        "-map", "[out_final]",
+        fc2,
         "-c:v", "libx265", 
         "-crf", str(crf),
         "-preset", "veryfast",
-        "-map", "0:a:?",
+        "-map", "\"3:a:?\"",
         "-c:a", "copy",
-        result_name,
+        "\""+result_name+"\"",
         "-y"
     ]
 
-    subprocess.run(cmd)
+    print(cmd)
+
+    subprocess.run(' '.join(cmd), shell=True)
 
     shutil.rmtree("process/masks")
 
