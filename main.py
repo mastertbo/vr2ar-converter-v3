@@ -14,6 +14,7 @@ import tempfile
 import shutil
 import pickle
 import torch
+import torch.nn as nn
 import cv2
 import gc
 import glob
@@ -31,6 +32,23 @@ import io
 import random
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
+
+import torch
+# Detect available GPUs
+num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+# Assign left/right eye models to separate GPUs if available
+if num_gpus >= 2:
+    deviceL = torch.device('cuda:0')
+    deviceR = torch.device('cuda:1')
+elif num_gpus == 1:
+    deviceL = deviceR = torch.device('cuda:0')
+else:
+    deviceL = deviceR = torch.device('cpu')
+
+# --- Tiling configuration (can be overridden with environment variables) ---
+TILE_ROWS    = int(os.getenv("TILE_ROWS", "2"))     # number of tile rows
+TILE_COLS    = int(os.getenv("TILE_COLS", "2"))     # number of tile columns
+TILE_OVERLAP = int(os.getenv("TILE_OVERLAP", "32")) # overlap (pixels) between tiles
 
 import torch.nn.functional as F
 import numpy as np
@@ -60,18 +78,37 @@ def gen_erosion(alpha, min_kernel_size, max_kernel_size):
     erode = cv2.erode(fg, kernel, iterations=1)*255
     return erode.astype(np.float32)
 
-def prepare_frame(frame, has_cuda=True):
-    vframes = torch.from_numpy(frame)
-        
-    if vframes.shape[-1] == 3:
-        vframes = vframes.permute(2, 0, 1)
-    
-    if has_cuda:
-         vframes =  vframes.cuda()
 
-    image_input = vframes.float() / 255.0
+# --- Helper utilities for tiling ---
+def split_into_tiles(img: np.ndarray, rows: int, cols: int, overlap: int):
+    """Return cropped tiles and their (y0,y1,x0,x1) coords."""
+    h, w = img.shape[:2]
+    th, tw = h // rows, w // cols
+    tiles, coords = [], []
+    for r in range(rows):
+        for c in range(cols):
+            y0 = max(r * th - overlap, 0)
+            x0 = max(c * tw - overlap, 0)
+            y1 = min((r + 1) * th + overlap, h)
+            x1 = min((c + 1) * tw + overlap, w)
+            tiles.append(img[y0:y1, x0:x1].copy())
+            coords.append((y0, y1, x0, x1))
+    return tiles, coords
 
-    return image_input
+def blend_tile(target: np.ndarray, tile_mask: np.ndarray, coord):
+    """Blend `tile_mask` into `target` at coord using max‑alpha."""
+    y0, y1, x0, x1 = coord
+    target[y0:y1, x0:x1] = np.maximum(target[y0:y1, x0:x1], tile_mask)
+
+
+# Device‑aware prepare_frame
+def prepare_frame(frame: np.ndarray, device: torch.device | None = None):
+    tensor = torch.from_numpy(frame)
+    if tensor.shape[-1] == 3:  # HWC → CHW
+        tensor = tensor.permute(2, 0, 1)
+    if device is not None:
+        tensor = tensor.to(device, non_blocking=True)
+    return tensor.float() / 255.0
 
 def fix_mask2(mask):
     mask = np.array(mask)
@@ -84,7 +121,8 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
+# helper_masks: Optional[dict], e.g. {frame_number: mask}
+def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False, helper_masks=None):
     global WORKER_STATUS
 
     _, mask_h = maskL.size
@@ -96,6 +134,9 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     file_name, file_extension = os.path.splitext(original_filename)
     
     video_info = FFmpegStream.get_video_info(video)
+
+    # --- helper_masks: allow for external keyframe mask injection ---
+    helper_masks_local = helper_masks or {}
     
     reader_config = {
         "parameter": {
@@ -113,10 +154,6 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     current_frame = 0
     objects = [1]
 
-    # adopted from published repo
-    WARMUP = 10
-    has_cuda = torch.torch.cuda.is_available()
-
     ffmpeg = FFmpegStream(
         video_path = video,
         config = reader_config,
@@ -127,17 +164,22 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
     result_name = file_name.replace(' ', '_') + "_" + str(projection).upper() + "_alpha" + file_extension 
     writer = ArVideoWriter(result_tmp_name, video_info.fps, crf)
 
-    matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone1 = matanyone1.cuda()
-    matanyone1 = matanyone1.eval()
-    processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
+    # --- build a single MatAnyOne2 model wrapped in DataParallel for multi-GPU inference ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    model = model.to(device).eval()
+    proc = InferenceCore(model, cfg=model.cfg)
+    processors = [proc]
+    device_list = [device]
+    num_processors = 1
 
-    matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone2 = matanyone2.cuda()
-    matanyone2 = matanyone2.eval()
-    processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+    # create a full‑frame initial mask (L+R) resized to the video resolution
+    maskL_np  = maskL.cpu().numpy() if torch.is_tensor(maskL) else np.array(maskL)
+    maskR_np  = maskR.cpu().numpy() if torch.is_tensor(maskR) else np.array(maskR)
+    init_mask = cv2.hconcat([maskL_np, maskR_np])
+    init_mask = cv2.resize(init_mask, (video_info.width, video_info.height), interpolation=cv2.INTER_NEAREST)
 
     while ffmpeg.isOpen():
         img = ffmpeg.read()
@@ -145,56 +187,38 @@ def process(job_id, video, projection, maskL, maskR, crf = 16, erode = False):
             break
         current_frame += 1
 
-        img_scaled = cv2.resize(img, (2*mask_h, mask_h))
+        tiles, coords = split_into_tiles(img, TILE_ROWS, TILE_COLS, TILE_OVERLAP)
+        full_mask_alpha = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
 
-        _, width = img_scaled.shape[:2]
-        imgL = img_scaled[:, :int(width/2)]
-        imgR = img_scaled[:, int(width/2):]
+        for tile_idx, (tile_img, coord) in enumerate(zip(tiles, coords)):
+            proc   = processors[0]
+            device = device_list[0]
 
-        imgLV = prepare_frame(imgL, has_cuda)
-        imgRV = prepare_frame(imgR, has_cuda)
+            tile_tensor = prepare_frame(tile_img, device=device)
 
-        if current_frame == 1:
-            imgLMask = maskL
-            imgRMask = maskR
+            # inject initial or helper masks at configured keyframes
+            if current_frame == 1 or current_frame in helper_masks_local:
+                # override init_mask if at a helper frame
+                if current_frame in helper_masks_local:
+                    init_mask = helper_masks_local[current_frame]
+                y0, y1, x0, x1 = coord
+                tile_init = torch.from_numpy(init_mask[y0:y1, x0:x1]).to(device)
+                prob = proc.step(tile_tensor, tile_init, objects=objects)
+            else:
+                prob = proc.step(tile_tensor)
 
-            output_prob_L = processor1.step(imgLV, imgLMask, objects=objects)
-            output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
-            
-            for i in range(WARMUP):
-                WORKER_STATUS = f"Warmup MatAnyone {i+1}/{WARMUP}"
-                output_prob_L = processor1.step(imgLV, first_frame_pred=True)
-                output_prob_R = processor2.step(imgRV, first_frame_pred=True)
-        else:
-            output_prob_L = processor1.step(imgLV)
-            output_prob_R = processor2.step(imgRV)
-
-        WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length}"
-        # print(WORKER_STATUS)
-
-        mask_output_L = processor1.output_prob_to_mask(output_prob_L)
-        mask_output_R = processor2.output_prob_to_mask(output_prob_R)
-
-        mask_output_L_pha = mask_output_L.unsqueeze(2).cpu().detach().numpy()
-        mask_output_R_pha = mask_output_R.unsqueeze(2).cpu().detach().numpy()
-
-        mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
-        mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
+            tile_mask = (proc.output_prob_to_mask(prob).cpu().numpy() * 255).astype(np.uint8)
+            blend_tile(full_mask_alpha, tile_mask, coord)
 
         if erode:
-            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
+            full_mask_alpha = cv2.erode(full_mask_alpha, (3,3), iterations=1)
 
-        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-        
-        writer.add_frame(img, combined_mask)
-
+        writer.add_frame(img, full_mask_alpha)
+        WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length}"
         gc.collect()
 
-    del processor1
-    del processor2
-    del matanyone1
-    del matanyone2
+    for p in processors:
+        del p
 
     if torch.torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -774,6 +798,12 @@ with gr.Blocks() as demo:
     demo.load(fn=lambda: result_list, outputs=output_videos)
 
 
+# Only launch the Gradio app when run as a script
+if __name__ == "__main__":
+    demo.queue(concurrency_count=1)
+    demo.launch()
+
+
 
 # --- Distributed/queue mode functions ---
 def launch_ui(redis_url, s3_bucket):
@@ -810,53 +840,5 @@ def launch_ui(redis_url, s3_bucket):
     add_button.click(
         fn=enqueue_job,
         inputs=[input_video, projection_dropdown, maskL, maskR, crf_dropdown, erode_checkbox],
-        outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR,
-                 maskSelectionL, maskSelectionR, mergedMaskL, mergedMaskR, previewMergedMaskL, previewMergedMaskR]
+        outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, maskL, maskPreviewR, maskR]
     )
-    demo.launch(server_name="0.0.0.0", server_port=7860)
-
-def run_worker(redis_url, s3_bucket):
-    r = redis.Redis.from_url(redis_url)
-    s3 = boto3.client("s3")
-    while True:
-        item = r.brpop("video_jobs", timeout=60)
-        if not item:
-            print("Queue empty, exiting")
-            break
-        _, raw = item
-        job = json.loads(raw)
-        # download inputs
-        s3.download_file(s3_bucket, job["video_key"], "/tmp/in.mp4")
-        s3.download_file(s3_bucket, job["maskL_key"], "/tmp/mask_L.png")
-        s3.download_file(s3_bucket, job["maskR_key"], "/tmp/mask_R.png")
-        # process
-        result_path = process(
-            0,
-            "/tmp/in.mp4",
-            job["projection"],
-            Image.open("/tmp/mask_L.png").convert("L"),
-            Image.open("/tmp/mask_R.png").convert("L"),
-            job["crf"],
-            job["erode"]
-        )
-        # upload output
-        out_key = job["video_key"].replace("inputs/", "outputs/")
-        s3.upload_file(result_path, s3_bucket, out_key)
-        print("Finished", out_key)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--serve-mode", action="store_true", help="Run headless worker mode")
-    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL"), help="Redis URL")
-    parser.add_argument("--s3-bucket", default=os.getenv("S3_BUCKET"), help="S3 bucket name")
-    args = parser.parse_args()
-
-    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    if args.serve_mode:
-        run_worker(args.redis_url, args.s3_bucket)
-    else:
-        launch_ui(args.redis_url, args.s3_bucket)
