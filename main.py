@@ -8,6 +8,11 @@ os.environ["DO_NOT_TRACK"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
+
 import traceback
 import gradio as gr
 import subprocess
@@ -45,8 +50,9 @@ MASK_SIZE = 1440
 SECONDS = 10
 WARMUP = 4
 JOB_VERSION = 3
-SSIM_THRESHOLD = 0.985
+SSIM_THRESHOLD = 0.983
 DEBUG = False
+SCHEDULE = bool(os.environ.get('EXECUTE_SCHEDULER_ON_START', "True"))
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -247,6 +253,8 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
     WORKER_STATUS = f"Combine Video and Audio..." 
     subprocess.run([
         "ffmpeg",
+        "-hide_banner", 
+        "-loglevel", "warning",
         "-i", result_tmp_name,
         "-i", video,
         "-c", "copy",
@@ -357,6 +365,8 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
                 print("ssim1", s1)
             if s1 > SSIM_THRESHOLD:
                 s2 = ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY))
+                if not DEBUG:
+                    print("ssim1", s1)
                 print("ssim2", s2)
                 if s2 > SSIM_THRESHOLD:
                     frame_match = True
@@ -442,7 +452,19 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 
                 combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
                 maskA = cv2.imread(frame_file.replace('frames', 'masks'), cv2.IMREAD_UNCHANGED)
-                mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
+                if False:
+                    mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
+                else:
+                    maskA = np.array(maskA)
+                    combined_mask = np.array(combined_mask)
+                    mergedA = np.zeros_like(maskA, dtype=np.uint8)
+
+                    above_200 = (maskA > 200) | (combined_mask > 200)
+                    other = ~above_200
+
+                    mergedA[above_200] = np.maximum(maskA[above_200], combined_mask[above_200])
+                    mergedA[other] = ((maskA[other] + combined_mask[other]) / 2).astype(np.uint8)
+
                 cv2.imwrite(frame_file.replace('frames', 'masks'), mergedA)
 
             print("reverse tracking of", subprocess_len, "completed")
@@ -474,6 +496,7 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
     gc.collect()
 
     WORKER_STATUS = f"Create Mask Video..."
+    print("create Video", result_name)
     scale = video_info.height / mask_h * 0.4
 
     fc2 = f'"[1]scale=iw*{scale}:-1[alpha];[2][alpha]scale2ref[mask][alpha];[alpha][mask]alphamerge,split=2[masked_alpha1][masked_alpha2]; [masked_alpha1]crop=iw/2:ih:0:0,split=2[masked_alpha_l1][masked_alpha_l2]; [masked_alpha2]crop=iw/2:ih:iw/2:0,split=4[masked_alpha_r1][masked_alpha_r2][masked_alpha_r3][masked_alpha_r4]; [0][masked_alpha_l1]overlay=W*0.5-w*0.5:-0.5*h[out_lt];[out_lt][masked_alpha_l2]overlay=W*0.5-w*0.5:H-0.5*h[out_tb]; [out_tb][masked_alpha_r1]overlay=0-w*0.5:-0.5*h[out_l_lt];[out_l_lt][masked_alpha_r2]overlay=0-w*0.5:H-0.5*h[out_tb_ltb]; [out_tb_ltb][masked_alpha_r3]overlay=W-w*0.5:-0.5*h[out_r_lt];[out_r_lt][masked_alpha_r4]overlay=W-w*0.5:H-0.5*h"'
@@ -481,7 +504,9 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 
     cmd = [
         "ffmpeg",
+        '-hide_banner',
         '-loglevel', 'warning',
+        '-thread_queue_size', '64',
         '-ss', FFmpegStream.frame_to_timestamp(0, video_info.fps),
         '-hwaccel', 'auto',
         '-i', "\""+str(video)+"\"",
@@ -504,13 +529,17 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
         '|',
         "ffmpeg",
         '-y',
+        '-hide_banner',
+        '-loglevel', 'error',
         '-f', 'rawvideo',
         '-vcodec', 'rawvideo',
         '-pix_fmt', 'bgr24',
         '-s', f'{video_info.width}x{video_info.height}',
         '-r', str(video_info.fps),
+        '-thread_queue_size', '64',
         '-i', 'pipe:0',
         '-r', str(video_info.fps),
+        '-thread_queue_size', '64',
         "-i", "\"process/masks/%06d.png\"",
         "-i", "mask.png",
         '-r', str(video_info.fps),
@@ -526,7 +555,8 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
         "-y"
     ]
 
-    print(cmd)
+    if DEBUG:
+        print(cmd)
 
     subprocess.run(' '.join(cmd), shell=True)
 
@@ -539,10 +569,13 @@ result_list = []
 frame_name = None
 
 def background_worker():
-    global file_list
     global WORKER_STATUS
     surplus_url = os.environ.get('JOB_SURPLUS_CHECK_URL')
     while True:
+        if not SCHEDULE:
+            time.sleep(3)
+            continue
+
         if surplus_url:
             try:
                 start_job = "True" in str(requests.get(surplus_url).json())
@@ -567,7 +600,7 @@ def background_worker():
             job = pickle.load(f)
 
         if job['version'] == JOB_VERSION:
-            print("Start job")
+            print("Start job", pkl)
             try:
                 if job['reverseTracking']:
                     result = process_with_reverse_tracking(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'])
@@ -578,25 +611,31 @@ def background_worker():
                     result_list.append(result)
                     if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
                         WORKER_STATUS = "Uploading..."
-                        if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
-                            client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
-                        else:
-                            client = FilebrowserClient(filebrowser_host, insecure=True)
+                        try:
+                            if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
+                                client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
+                            else:
+                                client = FilebrowserClient(filebrowser_host, insecure=True)
 
-                        asyncio.run(client.connect())
-                        couroutine = client.upload(
-                            local_path=result,
-                            remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
-                            override=False,
-                            concurrent=1,
-                        )
-                        asyncio.run(couroutine)
+                            asyncio.run(client.connect())
+                            couroutine = client.upload(
+                                local_path=result,
+                                remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
+                                override=True,
+                                concurrent=1,
+                            )
+                            asyncio.run(couroutine)
+                        except Exception as ex:
+                            print("upload failed", ex)
             except:
                 traceback.print_exc()
 
 
-        os.remove(job['video'])
-        os.remove(pkl)
+        os.makedirs('/jobs/completed', exist_ok=True)
+        shutil.move(job['video'], os.path.join('/jobs/completed', os.path.basename(job['video'])))
+        shutil.move(pkl, os.path.join('/jobs/completed', os.path.basename(pkl)))
+        print('job', pkl, 'completed')
+
         time.sleep(1)
         WORKER_STATUS = "Idle"
 
@@ -700,7 +739,19 @@ def generate_gallery_list():
     gallery_items = [(frame, str(str(max(0, int(idx*SECONDS - SECONDS/2))) + " sec")) for idx, frame in enumerate(frames)]
     return gallery_items
 
-def extract_frames(video, projection):
+def set_mask_size(x):
+    global MASK_SIZE
+    MASK_SIZE = int(x)
+    print("set mask size to", MASK_SIZE)
+
+def set_extract_frames_step(x):
+    global SECONDS
+    SECONDS = int(x)
+    print("set extract seconds to", SECONDS)
+
+def extract_frames(video, projection, mask_size, frames_seconds):
+    set_mask_size(mask_size)
+    set_extract_frames_step(frames_seconds)
     for dir in ["frames", "previews", "masksL", 'masksR']:
         if os.path.exists(dir):
             shutil.rmtree(dir)
@@ -709,13 +760,13 @@ def extract_frames(video, projection):
 
     if str(projection) == "eq":
         filter_complex = "split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
-        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
+        os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
         if SECONDS > 0:
-            os.system(f"ffmpeg -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
+            os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
     else:
-        os.system(f"ffmpeg -i \"{video.name}\" -frames:v 1 -pix_fmt bgr24 frames/0000.png")
+        os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -frames:v 1 -pix_fmt bgr24 frames/0000.png")
         if SECONDS > 0:
-            os.system(f"ffmpeg -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
+            os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
     
     frames = [os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")]
 
@@ -929,13 +980,9 @@ def merge_subtract_mask(maskL, maskR, mergedMaskL, mergedMaskR, dilate, erode):
 
     return  mergedMaskL, mergedMaskR, a, b, c, d
 
-def set_mask_size(x):
-    global MASK_SIZE
-    MASK_SIZE = int(x)
-
-def set_extract_frames_step(x):
-    global SECONDS
-    SECONDS = int(x)
+def set_schedule(x):
+    global SCHEDULE
+    SCHEDULE = bool(x)
 
 def generate_example(maskL, maskR):
     frameL = current_origin_frame['L'].frame_data
@@ -970,7 +1017,14 @@ def generate_example(maskL, maskR):
 
     return generate_mask_preview(cv2.imread("tmp_l.png"), 'L'), generate_mask_preview(cv2.imread('tmp_r.png'), 'R')
 
-
+def clear_completed_jobs():
+    folder_path = '/jobs/completed'
+    if not os.path.exists(folder_path):
+        return
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
 
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
@@ -1001,21 +1055,12 @@ with gr.Blocks() as demo:
             step=1,
             value=SECONDS
         )
-        mask_size.change(
-            fn=set_mask_size,
-            inputs=mask_size
-        )
-        extract_frames_step.change(
-            fn=set_extract_frames_step,
-            inputs=extract_frames_step
-        )
-
 
     with gr.Column():
         gr.Markdown("## Stage 2 - Extract First Frame")
         frame_button = gr.Button("Extract Projection Frame")
         gr.Markdown("### Frames")
-        gr.Markdown("Important: You need to provide a mask for 0 sec, Masks for the other frames are optional")
+        gr.Markdown("Important: You need to provide/generate a mask for 0 sec, Masks for the other frames are optional")
         gallery = gr.Gallery(label="Extracted Frames", show_label=True, columns=4, object_fit="contain")
         select_button = gr.Button("Load Slected Projection Frame")
         with gr.Row():
@@ -1175,7 +1220,7 @@ with gr.Blocks() as demo:
 
         frame_button.click(
             fn=extract_frames,
-            inputs=[input_video, projection_dropdown],
+            inputs=[input_video, projection_dropdown, mask_size, extract_frames_step],
             outputs=[gallery]
         )
 
@@ -1223,9 +1268,9 @@ with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("## Stage 4 - Add Job")
         crf_dropdown = gr.Dropdown(choices=[16,17,18,19,20,21,22], label="Encode CRF", value=16)
-        erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=False, info="")
+        erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=True, info="")
         force_init_mask_checkbox = gr.Checkbox(label="Force Init Mask", value=False, info="")
-        reverse_tracking_checkbox = gr.Checkbox(label="Reverse Tracking (experimental, caches mask for all frames inside /app/process until completed!)", value=False, info="")
+        reverse_tracking_checkbox = gr.Checkbox(label="Reverse Tracking (caches mask for all frames inside /app/process until completed!)", value=True, info="")
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
@@ -1234,16 +1279,32 @@ with gr.Blocks() as demo:
         )
 
     with gr.Column():
-        gr.Markdown("## Job Results")
-        status = gr.Textbox(label="Status", lines=2)
-        output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
+        gr.Markdown("## Job Control")
+        schedule_checkbox = gr.Checkbox(label="Enable Job Scheduling", value=SCHEDULE, info="")
+        clear_completed_jobs_button = gr.Button("Clear completed Jobs")
         restart_button = gr.Button("CLEANUP AND RESTART".upper())
+
         restart_button.click(
             # dirty hack, we use k8s restart pod
             fn=lambda: os.system("pkill python"),
             inputs=[],
             outputs=[]
         )
+
+        clear_completed_jobs_button.click(
+            fn=clear_completed_jobs
+        )
+
+        schedule_checkbox.change(
+            fn=set_schedule,
+            inputs=schedule_checkbox
+        )
+
+    with gr.Column():
+        gr.Markdown("## Job Results")
+        status = gr.Textbox(label="Status", lines=2)
+        output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
+        
 
     timer1 = gr.Timer(2, active=True)
     timer5 = gr.Timer(5, active=True)
