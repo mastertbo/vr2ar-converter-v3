@@ -41,5 +41,6 @@ COPY . /app
 RUN chmod +x entrypoint.sh
 
 RUN mkdir -p /jobs
+RUN mkdir -p /app/process
 
 ENTRYPOINT ["/app/entrypoint.sh"]

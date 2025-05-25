@@ -52,6 +52,7 @@ WARMUP = 4
 JOB_VERSION = 3
 SSIM_THRESHOLD = 0.983
 DEBUG = False
+MASK_DEBUG = False
 SCHEDULE = bool(os.environ.get('EXECUTE_SCHEDULER_ON_START', "True"))
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
@@ -338,9 +339,13 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
     if os.path.exists("process/masks"):
         shutil.rmtree("process/masks")
 
+    if os.path.exists("process/debug"):
+        shutil.rmtree("process/debug")
+
     os.makedirs("process", exist_ok=True)
     os.makedirs("process/frames", exist_ok=True)
     os.makedirs("process/masks", exist_ok=True)
+    os.makedirs("process/debug", exist_ok=True)
     reverse_track = False
 
     while ffmpeg.isOpen():
@@ -405,16 +410,14 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
         mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
         mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
 
-        if erode:
-            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
-
         combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
 
         if maskIdx < len(masks):
             cv2.imwrite('process/frames/' + str(current_frame).zfill(6) + ".png", img_scaled)
         
         cv2.imwrite('process/masks/' + str(current_frame).zfill(6) + ".png", combined_mask)
+        if MASK_DEBUG:
+            cv2.imwrite('process/debug/' + str(current_frame).zfill(6) + ".png", combined_mask)
 
         if reverse_track:
             imgLV_end = imgLV
@@ -446,26 +449,18 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
                 mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
                 mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
 
-                if erode:
-                    mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-                    mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
-
                 combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
                 maskA = cv2.imread(frame_file.replace('frames', 'masks'), cv2.IMREAD_UNCHANGED)
-                if False:
-                    mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
-                else:
-                    maskA = np.array(maskA)
-                    combined_mask = np.array(combined_mask)
-                    mergedA = np.zeros_like(maskA, dtype=np.uint8)
-
-                    above_200 = (maskA > 200) | (combined_mask > 200)
-                    other = ~above_200
-
-                    mergedA[above_200] = np.maximum(maskA[above_200], combined_mask[above_200])
-                    mergedA[other] = ((maskA[other] + combined_mask[other]) / 2).astype(np.uint8)
+                
+                if MASK_DEBUG:
+                    cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_rev.png'), combined_mask)
+                
+                # using avg or other merge gives much worse reults at edges
+                mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
 
                 cv2.imwrite(frame_file.replace('frames', 'masks'), mergedA)
+                if MASK_DEBUG:
+                    cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_res.png'), mergedA)
 
             print("reverse tracking of", subprocess_len, "completed")
             # set model state to forware tracking again
