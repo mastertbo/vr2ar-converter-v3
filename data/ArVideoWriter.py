@@ -18,7 +18,7 @@ class ArVideoWriter:
         self.fps = fps
         self.crf = crf
         self.mask_img = cv2.imread("mask.png", cv2.IMREAD_UNCHANGED)
-        self.process_buffer = Queue(maxsize=256)
+        self.process_buffer = Queue(maxsize=8)
         self.thread = Thread(target=self.run, args=())
         self.thread.daemon = True
         self.thread.start()
@@ -28,7 +28,7 @@ class ArVideoWriter:
 
     def add_frame(self, frame, alpha):
         while self.process_buffer.full():
-            time.sleep(0.05)
+            time.sleep(0.01)
         self.process_buffer.put((frame, alpha))
 
     def finalize(self):
@@ -121,15 +121,23 @@ class ArVideoWriter:
 
         def overlay_with_alpha(src, dst, x, y):
             h, w = src.shape[:2]
-            dst_y1, dst_y2 = y, y + h
-            dst_x1, dst_x2 = x, x + w
+            dst_h, dst_w = dst.shape[:2]
 
-            dst_crop = dst[dst_y1:dst_y2, dst_x1:dst_x2]
+            # Compute the region of interest in dst
+            crop_h = min(h, dst_h - y)
+            crop_w = min(w, dst_w - x)
+            if crop_h <= 0 or crop_w <= 0:
+                # No overlap
+                return
 
-            alpha = src[:, :, 3] / 255.0
+            # Crop src and alpha to fit inside dst
+            src_cropped = src[:crop_h, :crop_w]
+            dst_crop = dst[y:y+crop_h, x:x+crop_w]
+
+            alpha = src_cropped[:, :, 3] / 255.0
             alpha = alpha[..., np.newaxis]
 
-            dst_crop[:] = alpha * src[:, :, :3] + (1 - alpha) * dst_crop
+            dst_crop[:] = alpha * src_cropped[:, :, :3] + (1 - alpha) * dst_crop
 
         for overlay_img, (x, y) in overlay_params:
             overlay_with_alpha(overlay_img, result, x, y)
@@ -140,7 +148,7 @@ class ArVideoWriter:
     def run(self):
         while self.process_buffer.qsize() > 0 or not self.complete:
             if self.process_buffer.qsize() < 1:
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
 
             (frame, alpha) = self.process_buffer.get()

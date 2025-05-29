@@ -7,7 +7,7 @@ Convert your adult VR Videos into Passthrough AR Videos.
 
 Use the provided container and deploy on device with nvida gpu. Then use the buildin `grad.io` webui to convert your videos.
 
-## Usage
+## Highlevel Usage
 
 1. Create smal video chunks you want to convert to passthrough with no scene changes (i recommend chunks with length smaler than 3 minutes)
 2. Process these chunks via the provided gradio webui

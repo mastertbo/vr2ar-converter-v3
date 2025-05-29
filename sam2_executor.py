@@ -71,7 +71,7 @@ def get_bert_base_uncased_model_path():
     if glob.glob(
         os.path.join(bert_model_base, "**/model.safetensors"), recursive=True
     ):
-        print("grounding-dino is using model/bert-base-uncased")
+        # print("grounding-dino is using model/bert-base-uncased")
         return bert_model_base
     return "bert-base-uncased"
 
@@ -88,7 +88,7 @@ def load_sam_model(model_name):
         GlobalHydra.instance().clear()
 
     config_path = "sam2_configs"
-    initialize(config_path=config_path)
+    initialize(version_base=None, config_path=config_path)
     model_cfg = f"{model_type}.yaml"
 
     sam_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,7 +104,7 @@ def get_local_filepath(url, dirname, local_file_name=None):
 
     destination = os.path.join("model", local_file_name)
     if destination:
-        logger.warn(f"using extra model: {destination}")
+        # logger.warn(f"using extra model: {destination}")
         return destination
 
     folder = os.path.join("model", dirname)
@@ -238,11 +238,11 @@ def sam_segment(sam_model, image, boxes):
     masks, scores, _ = predictor.predict(
         point_coords=None, point_labels=None, box=boxes, multimask_output=False
     )
-    print("scores: ", scores)
-    print("masks shape before any modification:", masks.shape)
+    # print("scores: ", scores)
+    # print("masks shape before any modification:", masks.shape)
     if masks.ndim == 3:
         masks = np.expand_dims(masks, axis=0)
-    print("masks shape after ensuring 4D:", masks.shape)
+    # print("masks shape after ensuring 4D:", masks.shape)
     masks = np.transpose(masks, (1, 0, 2, 3))
     return create_tensor_output(image_np, masks, boxes)
 
