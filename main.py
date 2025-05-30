@@ -26,6 +26,7 @@ import glob
 import time
 import threading
 import queue
+import urllib3
 import asyncio
 import subprocess
 import requests
@@ -45,6 +46,8 @@ from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
 from filebrowser_client import FilebrowserClient
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 WORKER_STATUS = "Idle"
 MASK_SIZE = 1440
 SECONDS = 10
@@ -53,6 +56,7 @@ JOB_VERSION = 3
 SSIM_THRESHOLD = 0.983
 DEBUG = False
 MASK_DEBUG = False
+SURPLUS_IGNORE = False
 SCHEDULE = bool(os.environ.get('EXECUTE_SCHEDULER_ON_START', "True"))
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
@@ -571,9 +575,9 @@ def background_worker():
             time.sleep(3)
             continue
 
-        if surplus_url:
+        if surplus_url and not SURPLUS_IGNORE:
             try:
-                start_job = "True" in str(requests.get(surplus_url).json())
+                start_job = "True" in str(requests.get(surplus_url, verify=False).json())
             except Exception as ex:
                 start_job = False
                 print(ex)
@@ -979,6 +983,10 @@ def set_schedule(x):
     global SCHEDULE
     SCHEDULE = bool(x)
 
+def set_sureplus_ignore(x):
+    global SURPLUS_IGNORE
+    SURPLUS_IGNORE = bool(x)
+
 def generate_example(maskL, maskR):
     frameL = current_origin_frame['L'].frame_data
     frameR = current_origin_frame['R'].frame_data
@@ -1276,6 +1284,7 @@ with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("## Job Control")
         schedule_checkbox = gr.Checkbox(label="Enable Job Scheduling", value=SCHEDULE, info="")
+        ignore_surplus_checkbox = gr.Checkbox(label="Ignore Surplus Scheduling", value=SURPLUS_IGNORE, info="")
         clear_completed_jobs_button = gr.Button("Clear completed Jobs")
         restart_button = gr.Button("CLEANUP AND RESTART".upper())
 
@@ -1293,6 +1302,11 @@ with gr.Blocks() as demo:
         schedule_checkbox.change(
             fn=set_schedule,
             inputs=schedule_checkbox
+        )
+
+        ignore_surplus_checkbox.change(
+            fn=set_sureplus_ignore,
+            inputs=ignore_surplus_checkbox
         )
 
     with gr.Column():
