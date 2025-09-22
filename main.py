@@ -31,6 +31,8 @@ import asyncio
 import subprocess
 import requests
 import random
+from pathlib import Path
+from typing import List, Optional
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
@@ -44,6 +46,7 @@ from matanyone.inference.inference_core import InferenceCore
 from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
+import processing_core
 from filebrowser_client import FilebrowserClient
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -58,6 +61,14 @@ DEBUG = False
 MASK_DEBUG = False
 SURPLUS_IGNORE = False
 SCHEDULE = bool(os.environ.get('EXECUTE_SCHEDULER_ON_START', "True"))
+RESULT_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm'}
+COMPLETED_JOB_DIR = Path('/jobs/completed')
+
+
+def _set_worker_status(message: str) -> None:
+    global WORKER_STATUS
+    WORKER_STATUS = message
+
 
 def gen_dilate(alpha, min_kernel_size, max_kernel_size): 
     kernel_size = random.randint(min_kernel_size, max_kernel_size)
@@ -111,171 +122,29 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(video, projection, masks, crf = 16, erode = False, force_init_mask=False):
-    global WORKER_STATUS
-
-    maskIdx = 0
-    _, mask_h = masks[maskIdx]['maskL'].size
-
-    original_filename = os.path.basename(video)
-    file_name, file_extension = os.path.splitext(original_filename)
-    
-    video_info = FFmpegStream.get_video_info(video)
-    
-    reader_config = {
-        "parameter": {
-            "width": video_info.width,
-            "height": video_info.height,
-        }
+def process(video, projection, masks, crf = 16, erode = False, force_init_mask=False, job_id: str | None = None):
+    helpers = {
+        'prepare_frame': prepare_frame,
+        'fix_mask2': fix_mask2,
+        'set_status': _set_worker_status,
     }
-    
-    if "eq" == projection:
-        reader_config["filter_complex"] = "[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
-        projection = "fisheye180"
-
-    WORKER_STATUS = f"Load Models to create Masks"
-
-    current_frame = 0
-    objects = [1]
-
-    has_cuda = torch.torch.cuda.is_available()
-
-    ffmpeg = FFmpegStream(
-        video_path = video,
-        config = reader_config,
-        skip_frames = 0
+    return processing_core.process_video(
+        video=video,
+        projection=projection,
+        masks=masks,
+        crf=crf,
+        erode=erode,
+        force_init_mask=force_init_mask,
+        reverse_tracking=False,
+        helpers=helpers,
+        warmup=WARMUP,
+        ssim_threshold=SSIM_THRESHOLD,
+        job_id=job_id,
+        job_version=JOB_VERSION,
     )
 
-    result_tmp_name = file_name + "_" + str(projection).upper() + "_alpha_tmp" + file_extension 
-    result_name = file_name + "_" + str(projection).upper() + "_alpha" + file_extension 
-    writer = ArVideoWriter(result_tmp_name, video_info.fps, crf)
-
-    matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone1 = matanyone1.cuda()
-    matanyone1 = matanyone1.eval()
-    processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
-
-    matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone2 = matanyone2.cuda()
-    matanyone2 = matanyone2.eval()
-    processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
-
-    for i in range(len(masks)):
-        imgLV = prepare_frame(masks[i]['frameL'], has_cuda)
-        imgRV = prepare_frame(masks[i]['frameR'], has_cuda)
-        imgLMask = fix_mask2(masks[i]['maskL'])
-        imgRMask = fix_mask2(masks[i]['maskR'])
-        _ = processor1.step(imgLV, imgLMask, objects=objects, force_permanent=True)
-        _ = processor2.step(imgRV, imgRMask, objects=objects, force_permanent=True)
-
-    while ffmpeg.isOpen():
-        img = ffmpeg.read()
-        if img is None:
-            break
-        current_frame += 1
-
-        img_scaled = cv2.resize(img, (2*mask_h, mask_h))
-
-        _, width = img_scaled.shape[:2]
-        imgL = img_scaled[:, :int(width/2)]
-        imgR = img_scaled[:, int(width/2):]
-
-        imgLV = prepare_frame(imgL, has_cuda)
-        imgRV = prepare_frame(imgR, has_cuda)
-
-        frame_match = False
-        if force_init_mask and current_frame == 1:
-            frame_match = True
-
-        if maskIdx < len(masks):
-            if ssim(masks[maskIdx]['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > SSIM_THRESHOLD:
-                if ssim(masks[maskIdx]['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > SSIM_THRESHOLD:
-                    frame_match = True
-
-        if frame_match:
-            print("match at", current_frame)
-            imgLMask = fix_mask2(masks[maskIdx]['maskL'])
-            imgRMask = fix_mask2(masks[maskIdx]['maskR'])
-            maskIdx += 1
-
-            output_prob_L = processor1.step(imgLV, imgLMask, objects=objects)
-            output_prob_R = processor2.step(imgRV, imgRMask, objects=objects)
-            
-            for _ in range(WARMUP):
-                output_prob_L = processor1.step(imgLV, first_frame_pred=maskIdx==1)
-                output_prob_R = processor2.step(imgRV, first_frame_pred=maskIdx==1)
-        elif maskIdx > 0:
-            output_prob_L = processor1.step(imgLV)
-            output_prob_R = processor2.step(imgRV)
-        else:
-            print("Warning: Start frame not found yet")
-            continue
-
-        WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length}"
-
-        mask_output_L = processor1.output_prob_to_mask(output_prob_L)
-        mask_output_R = processor2.output_prob_to_mask(output_prob_R)
-
-        mask_output_L_pha = mask_output_L.unsqueeze(2).cpu().detach().numpy()
-        mask_output_R_pha = mask_output_R.unsqueeze(2).cpu().detach().numpy()
-
-        mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
-        mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
-
-        if erode:
-            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3,3), iterations=1)
-            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3,3), iterations=1)
-
-        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-        
-        writer.add_frame(img, combined_mask)
-
-        gc.collect()
-
-    if maskIdx < len(masks):
-        print("ERROR: not all frames found in video!")
-
-    del processor1
-    del processor2
-    del matanyone1
-    del matanyone2
-
-    if torch.torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    ffmpeg.stop()
-    writer.finalize()
-
-    total_frames = current_frame
-    while not writer.is_finished():
-        WORKER_STATUS = f"Encode Frame {writer.get_current_frame_number()}/{total_frames}"
-        time.sleep(0.5)
-
-    gc.collect()
-
-    WORKER_STATUS = f"Combine Video and Audio..." 
-    subprocess.run([
-        "ffmpeg",
-        "-hide_banner", 
-        "-loglevel", "warning",
-        "-i", result_tmp_name,
-        "-i", video,
-        "-c", "copy",
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        result_name
-    ])
-
-    os.remove(result_tmp_name)
-
-    WORKER_STATUS = f"Convertion completed" 
-    return result_name
-
-
 @torch.no_grad()
-def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = False, force_init_mask=False):
+def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = False, force_init_mask=False, job_id: Optional[str] = None):
     global WORKER_STATUS
 
     maskIdx = 0
@@ -564,7 +433,52 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
     WORKER_STATUS = f"Convertion completed" 
     return result_name
 
-result_list = []
+result_list: List[str] = []
+
+
+def _load_existing_results() -> None:
+    global result_list
+    try:
+        COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print("Unable to prepare completed job directory", exc)
+        return
+    for candidate in sorted(COMPLETED_JOB_DIR.iterdir()):
+        if candidate.is_file() and candidate.suffix.lower() in RESULT_EXTENSIONS:
+            path_str = str(candidate)
+            if path_str not in result_list:
+                result_list.append(path_str)
+
+
+def _persist_result(result_path: Optional[str]) -> Optional[str]:
+    if not result_path:
+        return None
+    src = Path(result_path)
+    if not src.exists():
+        return None
+    try:
+        COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print("Unable to prepare completed job directory", exc)
+        return str(src)
+    target = COMPLETED_JOB_DIR / src.name
+    if src == target:
+        return str(src)
+    try:
+        shutil.move(str(src), str(target))
+        return str(target)
+    except Exception as move_exc:
+        print("Failed to move result to completed folder", move_exc)
+        try:
+            shutil.copy2(str(src), str(target))
+            os.remove(str(src))
+            return str(target)
+        except Exception as copy_exc:
+            print("Failed to copy result to completed folder", copy_exc)
+            return str(src)
+
+
+_load_existing_results()
 frame_name = None
 
 def background_worker():
@@ -602,12 +516,14 @@ def background_worker():
             print("Start job", pkl)
             try:
                 if job['reverseTracking']:
-                    result = process_with_reverse_tracking(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'])
+                    result = process_with_reverse_tracking(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'], job_id=job.get('job_id'))
                 else:
-                    result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'])
+                    result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'], job_id=job.get('job_id'))
                 
-                if result is not None and os.path.exists(result):
-                    result_list.append(result)
+                persisted_result = _persist_result(result)
+                if persisted_result and os.path.exists(persisted_result):
+                    if persisted_result not in result_list:
+                        result_list.append(persisted_result)
                     if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
                         WORKER_STATUS = "Uploading..."
                         try:
@@ -617,22 +533,33 @@ def background_worker():
                                 client = FilebrowserClient(filebrowser_host, insecure=True)
 
                             asyncio.run(client.connect())
-                            couroutine = client.upload(
-                                local_path=result,
-                                remote_path=os.environ.get('FILEBROWSER_PATH', os.path.basename(result)).replace("{filename}", os.path.basename(result)),
+                            remote_target = os.environ.get('FILEBROWSER_PATH', os.path.basename(persisted_result)).replace("{filename}", os.path.basename(persisted_result))
+                            coroutine = client.upload(
+                                local_path=persisted_result,
+                                remote_path=remote_target,
                                 override=True,
                                 concurrent=1,
                             )
-                            asyncio.run(couroutine)
+                            asyncio.run(coroutine)
                         except Exception as ex:
                             print("upload failed", ex)
             except:
                 traceback.print_exc()
 
 
-        os.makedirs('/jobs/completed', exist_ok=True)
-        shutil.move(job['video'], os.path.join('/jobs/completed', os.path.basename(job['video'])))
-        shutil.move(pkl, os.path.join('/jobs/completed', os.path.basename(pkl)))
+        try:
+            COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print("Unable to prepare completed job directory", exc)
+        else:
+            try:
+                shutil.move(job['video'], str(COMPLETED_JOB_DIR / os.path.basename(job['video'])))
+            except (FileNotFoundError, shutil.Error) as exc:
+                print("Failed to archive source video", job['video'], exc)
+            try:
+                shutil.move(pkl, str(COMPLETED_JOB_DIR / os.path.basename(pkl)))
+            except (FileNotFoundError, shutil.Error) as exc:
+                print("Failed to archive job metadata", pkl, exc)
         print('job', pkl, 'completed')
 
         time.sleep(1)
@@ -679,10 +606,12 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
     ts = str(int(time.time()))
 
     dest = '/jobs/' + ts + "_" + os.path.basename(video.name)
+    job_id = processing_core._compute_job_id(dest, projection)
     shutil.move(video.name, dest)
 
     job_data = {
         'version': JOB_VERSION,
+        'job_id': job_id,
         'video': dest,
         'projection': projection,
         'crf': crf,
@@ -1021,13 +950,16 @@ def generate_example(maskL, maskR):
     return generate_mask_preview(cv2.imread("tmp_l.png"), 'L'), generate_mask_preview(cv2.imread('tmp_r.png'), 'R')
 
 def clear_completed_jobs():
-    folder_path = '/jobs/completed'
-    if not os.path.exists(folder_path):
+    global result_list
+    if not COMPLETED_JOB_DIR.exists():
         return
-    for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
-        if os.path.isfile(file_path):
-            os.remove(file_path)
+    for file_path in COMPLETED_JOB_DIR.iterdir():
+        if file_path.is_file():
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                print("Failed to remove completed file", file_path, exc)
+    result_list = [path for path in result_list if os.path.exists(path)]
 
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
@@ -1333,3 +1265,7 @@ if __name__ == "__main__":
     worker_thread.start()
     demo.launch(server_name="0.0.0.0", server_port=7860)
     print("exit")
+
+
+
+
