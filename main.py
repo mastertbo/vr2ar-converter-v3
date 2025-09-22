@@ -14,6 +14,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 
 import traceback
+import json
 import gradio as gr
 import subprocess
 import tempfile
@@ -63,7 +64,17 @@ SURPLUS_IGNORE = False
 SCHEDULE = bool(os.environ.get('EXECUTE_SCHEDULER_ON_START', "True"))
 RESULT_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm'}
 COMPLETED_JOB_DIR = Path('/jobs/completed')
+PENDING_JOBS_DIR = Path('/jobs/pending')
+WORKERS_DIR = Path('/jobs/workers')
+FAILED_JOB_DIR = Path('/jobs/failed')
 
+
+def _ensure_base_dirs() -> None:
+    for directory in (COMPLETED_JOB_DIR, PENDING_JOBS_DIR, WORKERS_DIR, FAILED_JOB_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_base_dirs()
 
 def _set_worker_status(message: str) -> None:
     global WORKER_STATUS
@@ -436,18 +447,24 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 result_list: List[str] = []
 
 
-def _load_existing_results() -> None:
+def _refresh_result_list() -> None:
     global result_list
-    try:
-        COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        print("Unable to prepare completed job directory", exc)
-        return
-    for candidate in sorted(COMPLETED_JOB_DIR.iterdir()):
-        if candidate.is_file() and candidate.suffix.lower() in RESULT_EXTENSIONS:
-            path_str = str(candidate)
-            if path_str not in result_list:
-                result_list.append(path_str)
+    refreshed: List[str] = []
+    if COMPLETED_JOB_DIR.exists():
+        for candidate in sorted(COMPLETED_JOB_DIR.iterdir()):
+            if candidate.is_file() and candidate.suffix.lower() in RESULT_EXTENSIONS:
+                refreshed.append(str(candidate))
+    result_list = refreshed
+
+
+
+def _load_existing_results() -> None:
+    _refresh_result_list()
+
+
+def _get_result_files() -> List[str]:
+    _refresh_result_list()
+    return result_list
 
 
 def _persist_result(result_path: Optional[str]) -> Optional[str]:
@@ -478,6 +495,163 @@ def _persist_result(result_path: Optional[str]) -> Optional[str]:
             return str(src)
 
 
+def _run_filebrowser_upload(result_path: Optional[str]) -> None:
+    if not result_path or not os.path.exists(result_path):
+        return
+    filebrowser_host = os.environ.get('FILEBROWSER_HOST')
+    if not filebrowser_host:
+        return
+    try:
+        if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
+            client = FilebrowserClient(
+                filebrowser_host,
+                username=filebrowser_user,
+                password=os.environ.get('FILEBROWSER_PASSWORD'),
+                insecure=True,
+            )
+        else:
+            client = FilebrowserClient(filebrowser_host, insecure=True)
+        asyncio.run(client.connect())
+        remote_target = os.environ.get('FILEBROWSER_PATH', os.path.basename(result_path)).replace("{filename}", os.path.basename(result_path))
+        coroutine = client.upload(
+            local_path=result_path,
+            remote_path=remote_target,
+            override=True,
+            concurrent=1,
+        )
+        asyncio.run(coroutine)
+    except Exception as ex:
+        print("upload failed", ex)
+
+
+def _archive_job_artifacts(job: dict, pkl_path: Path) -> None:
+    try:
+        COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print("Unable to prepare completed job directory", exc)
+    video_path = Path(str(job.get('video', '')))
+    if video_path.exists():
+        target_video = COMPLETED_JOB_DIR / video_path.name
+        try:
+            shutil.move(str(video_path), str(target_video))
+        except (FileNotFoundError, shutil.Error) as exc:
+            print("Failed to archive source video", video_path, exc)
+    try:
+        shutil.move(str(pkl_path), str(COMPLETED_JOB_DIR / pkl_path.name))
+    except (FileNotFoundError, shutil.Error) as exc:
+        print("Failed to archive job metadata", pkl_path, exc)
+
+
+def _mark_job_failed(job: dict, pkl_path: Path, error: Exception) -> None:
+    try:
+        FAILED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print("Unable to prepare failed job directory", exc)
+    video_path = Path(str(job.get('video', '')))
+    if video_path.exists():
+        target_video = FAILED_JOB_DIR / video_path.name
+        try:
+            shutil.move(str(video_path), str(target_video))
+        except (FileNotFoundError, shutil.Error) as exc:
+            print("Failed to move failed job video", video_path, exc)
+    try:
+        shutil.move(str(pkl_path), str(FAILED_JOB_DIR / pkl_path.name))
+    except (FileNotFoundError, shutil.Error) as exc:
+        print("Failed to move failed job metadata", pkl_path, exc)
+    failure_note = FAILED_JOB_DIR / f"{pkl_path.stem}.error.txt"
+    try:
+        failure_note.write_text(f"{time.time()}: {error}\n")
+
+    except OSError:
+        pass
+
+
+def _run_job(job: dict) -> Optional[str]:
+    if job.get('reverseTracking'):
+        return process_with_reverse_tracking(
+            job['video'],
+            job['projection'],
+            job['masks'],
+            job['crf'],
+            job['erode'],
+            job['forceInitMask'],
+            job_id=job.get('job_id'),
+        )
+    return process(
+        job['video'],
+        job['projection'],
+        job['masks'],
+        job['crf'],
+        job['erode'],
+        job['forceInitMask'],
+        job_id=job.get('job_id'),
+    )
+
+
+def _get_worker_directories() -> List[Path]:
+    if not WORKERS_DIR.exists():
+        return []
+    return sorted([entry for entry in WORKERS_DIR.iterdir() if entry.is_dir()])
+
+
+def _read_worker_status(worker_dir: Path) -> dict:
+    status_path = worker_dir / 'status.json'
+    if status_path.exists():
+        try:
+            return json.loads(status_path.read_text())
+        except json.JSONDecodeError:
+            return {'state': 'unknown'}
+    return {'state': 'unknown'}
+
+
+def _find_idle_worker(worker_dirs: List[Path]) -> Optional[Path]:
+    for worker_dir in worker_dirs:
+        status = _read_worker_status(worker_dir)
+        assigned = list(worker_dir.glob('*.pkl'))
+        if not assigned and status.get('state') in (None, 'idle', 'unknown'):
+            return worker_dir
+    return None
+
+
+def _dispatch_job_to_worker(pkl_path: Path, worker_dir: Path) -> None:
+    with open(pkl_path, 'rb') as handle:
+        job = pickle.load(handle)
+    video_path = Path(job['video'])
+    target_video = worker_dir / video_path.name
+    target_video.parent.mkdir(parents=True, exist_ok=True)
+    if video_path.exists():
+        shutil.move(str(video_path), str(target_video))
+    job['video'] = str(target_video)
+    job['assigned_to'] = worker_dir.name
+    job['dispatched_at'] = time.time()
+    target_pkl = worker_dir / pkl_path.name
+    with open(target_pkl, 'wb') as handle:
+        pickle.dump(job, handle)
+    try:
+        pkl_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _pending_job_files() -> List[Path]:
+    if not PENDING_JOBS_DIR.exists():
+        return []
+    return sorted(PENDING_JOBS_DIR.glob('*.pkl'))
+
+
+def _write_worker_status(worker_dir: Path, state: str, job_id: Optional[str] = None) -> None:
+    status_payload = {
+        'state': state,
+        'job_id': job_id,
+        'updated_at': time.time(),
+    }
+    status_path = worker_dir / 'status.json'
+    try:
+        status_path.write_text(json.dumps(status_payload))
+    except OSError as exc:
+        print('Failed to update worker status', worker_dir, exc)
+
+
 _load_existing_results()
 frame_name = None
 
@@ -501,69 +675,70 @@ def background_worker():
                 time.sleep(30)
                 continue
 
-        pkl = [x for x in glob.glob("/jobs/*.pkl")]
+        worker_dirs = _get_worker_directories()
+        pending_jobs = _pending_job_files()
 
-        if len(pkl) == 0:
+        if worker_dirs:
+            if not pending_jobs:
+                WORKER_STATUS = "Idle"
+                time.sleep(2)
+                continue
+
+            idle_worker = _find_idle_worker(worker_dirs)
+            if idle_worker is None:
+                WORKER_STATUS = "All workers busy"
+                time.sleep(2)
+                continue
+
+            job_path = pending_jobs[0]
+            WORKER_STATUS = f"Dispatch {job_path.name} -> {idle_worker.name}"
+            try:
+                _dispatch_job_to_worker(job_path, idle_worker)
+            except Exception as exc:
+                print("Failed to dispatch job", job_path, exc)
+                time.sleep(2)
+            else:
+                WORKER_STATUS = "Idle"
+            continue
+
+        if not pending_jobs:
+            WORKER_STATUS = "Idle"
             time.sleep(2)
             continue
 
-        pkl = sorted(pkl)[0]
-        time.sleep(2) # ensure file is fully written
-        with open(pkl, 'rb') as f:
-            job = pickle.load(f)
-
-        if job['version'] == JOB_VERSION:
-            print("Start job", pkl)
-            try:
-                if job['reverseTracking']:
-                    result = process_with_reverse_tracking(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'], job_id=job.get('job_id'))
-                else:
-                    result = process(job['video'], job['projection'], job['masks'], job['crf'], job['erode'], job['forceInitMask'], job_id=job.get('job_id'))
-                
-                persisted_result = _persist_result(result)
-                if persisted_result and os.path.exists(persisted_result):
-                    if persisted_result not in result_list:
-                        result_list.append(persisted_result)
-                    if filebrowser_host := os.environ.get('FILEBROWSER_HOST'):
-                        WORKER_STATUS = "Uploading..."
-                        try:
-                            if filebrowser_user := os.environ.get('FILEBROWSER_USER'):
-                                client = FilebrowserClient(filebrowser_host, username=filebrowser_user, password=os.environ.get('FILEBROWSER_PASSWORD'), insecure=True)
-                            else:
-                                client = FilebrowserClient(filebrowser_host, insecure=True)
-
-                            asyncio.run(client.connect())
-                            remote_target = os.environ.get('FILEBROWSER_PATH', os.path.basename(persisted_result)).replace("{filename}", os.path.basename(persisted_result))
-                            coroutine = client.upload(
-                                local_path=persisted_result,
-                                remote_path=remote_target,
-                                override=True,
-                                concurrent=1,
-                            )
-                            asyncio.run(coroutine)
-                        except Exception as ex:
-                            print("upload failed", ex)
-            except:
-                traceback.print_exc()
-
+        job_path = pending_jobs[0]
 
         try:
-            COMPLETED_JOB_DIR.mkdir(parents=True, exist_ok=True)
+            with open(job_path, 'rb') as handle:
+                job = pickle.load(handle)
         except Exception as exc:
-            print("Unable to prepare completed job directory", exc)
-        else:
-            try:
-                shutil.move(job['video'], str(COMPLETED_JOB_DIR / os.path.basename(job['video'])))
-            except (FileNotFoundError, shutil.Error) as exc:
-                print("Failed to archive source video", job['video'], exc)
-            try:
-                shutil.move(pkl, str(COMPLETED_JOB_DIR / os.path.basename(pkl)))
-            except (FileNotFoundError, shutil.Error) as exc:
-                print("Failed to archive job metadata", pkl, exc)
-        print('job', pkl, 'completed')
+            print("Failed to read job", job_path, exc)
+            _mark_job_failed({'video': ''}, job_path, exc)
+            time.sleep(2)
+            continue
 
-        time.sleep(1)
-        WORKER_STATUS = "Idle"
+        if job.get('version') != JOB_VERSION:
+            print("Skip job due to version mismatch", job_path)
+            _mark_job_failed(job, job_path, Exception('JOB_VERSION mismatch'))
+            time.sleep(2)
+            continue
+
+        WORKER_STATUS = f"Processing {job_path.name}"
+        try:
+            result = _run_job(job)
+            persisted_result = _persist_result(result)
+            if persisted_result and os.path.exists(persisted_result):
+                _refresh_result_list()
+                WORKER_STATUS = "Uploading..."
+                _run_filebrowser_upload(persisted_result)
+            _archive_job_artifacts(job, job_path)
+        except Exception as exc:
+            traceback.print_exc()
+            _mark_job_failed(job, job_path, exc)
+        finally:
+            WORKER_STATUS = "Idle"
+            time.sleep(1)
+
 
 def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
     RETURN_VALUES = 16
@@ -605,14 +780,15 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
 
     ts = str(int(time.time()))
 
-    dest = '/jobs/' + ts + "_" + os.path.basename(video.name)
-    job_id = processing_core._compute_job_id(dest, projection)
-    shutil.move(video.name, dest)
+    PENDING_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    dest_path = PENDING_JOBS_DIR / f"{ts}_" + os.path.basename(video.name)
+    shutil.move(video.name, str(dest_path))
+    job_id = processing_core._compute_job_id(str(dest_path), projection)
 
     job_data = {
         'version': JOB_VERSION,
         'job_id': job_id,
-        'video': dest,
+        'video': str(dest_path),
         'projection': projection,
         'crf': crf,
         'masks': masks,
@@ -621,15 +797,17 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
         'reverseTracking': reverseTracking
     }
 
-    with open(f"/jobs/{ts}.pkl", "wb") as f:
+    job_pkl_path = PENDING_JOBS_DIR / f"{ts}.pkl"
+    with job_pkl_path.open("wb") as f:
         pickle.dump(job_data, f)
 
     return tuple(None for _ in range(RETURN_VALUES))
 
 def status_text():
-    pending_jobs = len([x for x in glob.glob("/jobs/*.pkl")])
-    return "Worker Status: " + WORKER_STATUS + "\n" \
-        + f"Pending Jobs: {pending_jobs}"
+    pending_jobs = len(_pending_job_files())
+    assigned_jobs = sum(len(list(worker_dir.glob('*.pkl'))) for worker_dir in _get_worker_directories())
+    return ("Worker Status: " + WORKER_STATUS + "\n"
+        + f"Pending Jobs: {pending_jobs} | Assigned Jobs: {assigned_jobs}")
 
 current_origin_frame = {
     "L": None,
@@ -959,7 +1137,55 @@ def clear_completed_jobs():
                 file_path.unlink()
             except OSError as exc:
                 print("Failed to remove completed file", file_path, exc)
-    result_list = [path for path in result_list if os.path.exists(path)]
+    _refresh_result_list()
+
+
+
+def run_worker() -> None:
+    worker_id = os.environ.get('VR2AR_WORKER_ID') or os.environ.get('HOSTNAME') or 'worker'
+    worker_dir = WORKERS_DIR / worker_id
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Worker {worker_id} watching {worker_dir}")
+    _write_worker_status(worker_dir, 'idle')
+    while True:
+        assigned_jobs = sorted(worker_dir.glob('*.pkl'))
+        if not assigned_jobs:
+            _write_worker_status(worker_dir, 'idle')
+            time.sleep(2)
+            continue
+
+        job_path = assigned_jobs[0]
+        try:
+            with open(job_path, 'rb') as handle:
+                job = pickle.load(handle)
+        except Exception as exc:
+            print('Failed to load assigned job', job_path, exc)
+            _mark_job_failed({'video': ''}, job_path, exc)
+            _write_worker_status(worker_dir, 'idle')
+            time.sleep(2)
+            continue
+
+        if job.get('version') != JOB_VERSION:
+            print('Skip job due to version mismatch', job_path)
+            _mark_job_failed(job, job_path, Exception('JOB_VERSION mismatch'))
+            _write_worker_status(worker_dir, 'idle')
+            time.sleep(1)
+            continue
+
+        job_id = job.get('job_id')
+        _write_worker_status(worker_dir, 'processing', job_id)
+        try:
+            result = _run_job(job)
+            persisted_result = _persist_result(result)
+            if persisted_result and os.path.exists(persisted_result):
+                _run_filebrowser_upload(persisted_result)
+            _archive_job_artifacts(job, job_path)
+        except Exception as exc:
+            traceback.print_exc()
+            _mark_job_failed(job, job_path, exc)
+        finally:
+            _write_worker_status(worker_dir, 'idle')
+            time.sleep(1)
 
 with gr.Blocks() as demo:
     gr.Markdown("# Video VR2AR Converter")
@@ -1250,21 +1476,30 @@ with gr.Blocks() as demo:
     timer1 = gr.Timer(2, active=True)
     timer5 = gr.Timer(5, active=True)
     timer1.tick(status_text, outputs=status)
-    timer5.tick(lambda: result_list, outputs=output_videos)
+    timer5.tick(_get_result_files, outputs=output_videos)
     demo.load(fn=status_text, outputs=status)
-    demo.load(fn=lambda: result_list, outputs=output_videos)
+    demo.load(fn=_get_result_files, outputs=output_videos)
 
 
-if __name__ == "__main__":
+def run_ui() -> None:
     print("gradio version", gr.__version__)
     if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    
+
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
     demo.launch(server_name="0.0.0.0", server_port=7860)
     print("exit")
+
+
+if __name__ == "__main__":
+    role = os.environ.get('VR2AR_ROLE', 'ui').lower()
+    if role == 'worker':
+        run_worker()
+    else:
+        run_ui()
+
 
 
 

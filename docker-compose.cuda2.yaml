@@ -21,6 +21,26 @@ services:
       - "7860:7860"
     ipc: host
 
+  vr2ar-worker:
+    profiles: ["worker"]
+    image: "ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+              - nvidia.com/gpu=all
+    environment:
+      VR2AR_ROLE: worker
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      - vr2ar:/jobs
+      - process-cache:/app/process
+    ipc: host
+
 volumes:
   vr2ar:
     external: true
