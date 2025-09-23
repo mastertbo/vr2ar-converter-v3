@@ -2,7 +2,7 @@ services:
   vr2ar:
     # build:
     #  context: .
-    image: "ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest"
+    image: "ghcr.io/mastertbo/vr2ar-converter-v3:dispatch-worker"
     deploy:
       resources:
         reservations:
@@ -23,7 +23,7 @@ services:
 
   vr2ar-worker:
     profiles: ["worker"]
-    image: "ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest"
+    image: "ghcr.io/mastertbo/vr2ar-converter-v3:dispatch-worker"
     deploy:
       resources:
         reservations:
