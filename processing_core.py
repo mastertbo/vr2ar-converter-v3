@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -70,6 +70,121 @@ def _prepare_manual_masks(masks: List[Dict[str, Any]], prepare_frame: Callable[[
     return prepared
 
 
+def _scan_mask_directory(mask_dir: Path) -> Tuple[List[Tuple[int, Path]], int, int, bool]:
+    if not mask_dir.exists() or not mask_dir.is_dir():
+        raise FileNotFoundError(f"mask directory does not exist: {mask_dir}")
+
+    mask_candidates: List[Path] = sorted(mask_dir.glob('*.png'))
+    if not mask_candidates:
+        mask_candidates = sorted(mask_dir.glob('*.PNG'))
+    indexed_masks: List[Tuple[int, Path]] = []
+    for candidate in mask_candidates:
+        try:
+            frame_idx = int(candidate.stem)
+        except ValueError:
+            continue
+        indexed_masks.append((frame_idx, candidate))
+
+    if not indexed_masks:
+        raise ValueError(f'no numeric mask files found in {mask_dir}')
+
+    indexed_masks.sort(key=lambda item: item[0])
+    sample = cv2.imread(str(indexed_masks[0][1]), cv2.IMREAD_UNCHANGED)
+    if sample is None:
+        raise ValueError(f'failed to read mask image: {indexed_masks[0][1]}')
+    if sample.ndim == 3 and sample.shape[2] > 1:
+        sample = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+
+    mask_h, total_w = sample.shape[:2]
+    if total_w % 2 != 0:
+        raise ValueError('expected stereo masks with even combined width')
+    mask_w = total_w // 2
+
+    zero_based = indexed_masks[0][0] == 0
+
+    for _, path in indexed_masks[1:10]:
+        probe = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if probe is None:
+            raise ValueError(f'failed to read mask image: {path}')
+        if probe.ndim == 3 and probe.shape[2] > 1:
+            probe = cv2.cvtColor(probe, cv2.COLOR_BGR2GRAY)
+        if probe.shape[0] != mask_h or probe.shape[1] != total_w:
+            raise ValueError(f'inconsistent mask resolution in {mask_dir}')
+
+    return indexed_masks, mask_w, mask_h, zero_based
+
+
+def _normalize_frame_index(frame_idx: int, zero_based: bool) -> int:
+    if zero_based:
+        return frame_idx + 1
+    return frame_idx if frame_idx > 0 else 1
+
+
+def _mask_coverage_gaps(indexed_masks: List[Tuple[int, Path]], zero_based: bool,
+                        total_frames: int) -> List[int]:
+    available_frames = {
+        _normalize_frame_index(frame_idx, zero_based)
+        for frame_idx, _ in indexed_masks if frame_idx >= 0
+    }
+    missing = [frame for frame in range(1, total_frames + 1) if frame not in available_frames]
+    return missing
+
+
+def _prepare_mask_guides_from_directory(video: str, projection: str, indexed_masks: List[Tuple[int, Path]],
+                                        zero_based: bool, mask_w: int, mask_h: int,
+                                        stride: int = 1) -> List[Dict[str, Any]]:
+    if stride < 1:
+        raise ValueError('stride must be >= 1')
+
+    guides: List[Dict[str, Any]] = []
+    if projection == 'eq':
+        filter_complex = (
+            f"[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; "
+            f"[right]crop=ih:ih:ih:0[right_crop]; "
+            f"[left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; "
+            f"[right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; "
+            f"[leftfisheye][rightfisheye]hstack,scale={2 * mask_w}:{mask_h}[v]"
+        )
+    else:
+        filter_complex = None
+
+    for ordinal, (frame_idx, path) in enumerate(indexed_masks):
+        if stride > 1 and (ordinal % stride) != 0:
+            continue
+
+        frame_for_video = max(_normalize_frame_index(frame_idx, zero_based) - 1, 0)
+        frame = FFmpegStream.get_frame(video, frame_for_video, filter_complex=filter_complex)
+        if frame.shape[1] != 2 * mask_w or frame.shape[0] != mask_h:
+            frame = cv2.resize(frame, (2 * mask_w, mask_h), interpolation=cv2.INTER_AREA)
+
+        mask_frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask_frame is None:
+            raise ValueError(f'failed to read mask image: {path}')
+        if mask_frame.ndim == 3 and mask_frame.shape[2] > 1:
+            mask_frame = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+        if mask_frame.shape[1] != 2 * mask_w or mask_frame.shape[0] != mask_h:
+            mask_frame = cv2.resize(mask_frame, (2 * mask_w, mask_h), interpolation=cv2.INTER_NEAREST)
+
+        maskL = Image.fromarray(mask_frame[:, :mask_w]).convert('L')
+        maskR = Image.fromarray(mask_frame[:, mask_w:]).convert('L')
+
+        frameL = frame[:, :mask_w]
+        frameR = frame[:, mask_w:]
+        frameLGray = cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY)
+        frameRGray = cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY)
+
+        guides.append({
+            'maskL': maskL,
+            'maskR': maskR,
+            'frameL': frameL,
+            'frameR': frameR,
+            'frameLGray': frameLGray,
+            'frameRGray': frameRGray,
+        })
+
+    return guides
+
+
 def _detect_last_mask(mask_dir: Path) -> int:
     if not mask_dir.exists():
         return 0
@@ -125,6 +240,90 @@ def _warm_start(processor_left: InferenceCore, processor_right: InferenceCore,
     for _ in range(max(warmup, 1)):
         processor_left.step(imgLV)
         processor_right.step(imgRV)
+
+
+def stitch_existing_masks(*, video: str, projection: str, mask_dir: str, crf: int,
+                          helpers: Helpers, job_id: Optional[str] = None,
+                          job_version: int = 0) -> str:
+    set_status = helpers['set_status']
+
+    mask_dir_path = Path(mask_dir)
+    set_status('Validate existing masks...')
+    indexed_masks, mask_w, mask_h, zero_based = _scan_mask_directory(mask_dir_path)
+
+    video_info = FFmpegStream.get_video_info(video)
+    missing_frames = _mask_coverage_gaps(indexed_masks, zero_based, video_info.length)
+    if missing_frames:
+        preview = ', '.join(f"{frame:06d}" for frame in missing_frames[:10])
+        raise ValueError(f'missing masks for {len(missing_frames)} frame(s): {preview}')
+
+    projection_out = 'fisheye180' if projection == 'eq' else projection
+    reader_config: Dict[str, Any] = {
+        'parameter': {
+            'width': 2 * mask_w,
+            'height': mask_h,
+        }
+    }
+    if projection == 'eq':
+        reader_config['filter_complex'] = (
+            f"[0:v]split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; "
+            f"[right]crop=ih:ih:ih:0[right_crop]; "
+            f"[left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; "
+            f"[right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; "
+            f"[leftfisheye][rightfisheye]hstack,scale={2 * mask_w}:{mask_h}[v]"
+        )
+    else:
+        reader_config['video_filter'] = f'scale={2 * mask_w}:{mask_h}'
+
+    job_identifier = job_id or _compute_job_id(video, projection_out)
+    job_root = Path('process') / 'runs' / job_identifier
+    (job_root / 'masks').mkdir(parents=True, exist_ok=True)
+    (job_root / 'debug').mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        'job_id': job_identifier,
+        'video': video,
+        'projection': projection_out,
+        'total_frames': video_info.length,
+        'version': job_version,
+    }
+    progress = ProcessingProgress(str(job_root), metadata)
+    progress.update(last_frame=video_info.length, mask_idx=len(indexed_masks), total_frames=video_info.length)
+
+    tmp_name = f"{os.path.splitext(os.path.basename(video))[0]}_{projection_out.upper()}_alpha_tmp{os.path.splitext(os.path.basename(video))[1]}"
+    result_name = f"{os.path.splitext(os.path.basename(video))[0]}_{projection_out.upper()}_alpha{os.path.splitext(os.path.basename(video))[1]}"
+
+    set_status('Encode alpha using existing masks...')
+    _combine_with_alpha(
+        video=video,
+        reader_config=reader_config,
+        mask_dir=mask_dir_path,
+        tmp_name=tmp_name,
+        result_name=result_name,
+        video_info=video_info,
+        crf=crf,
+        set_status=set_status,
+    )
+
+    progress.mark_completed(result_name)
+    return result_name
+
+
+def prepare_masks_from_directory(video: str, projection: str, mask_dir: str,
+                                 stride: int = 1) -> List[Dict[str, Any]]:
+    indexed_masks, mask_w, mask_h, zero_based = _scan_mask_directory(Path(mask_dir))
+    guides = _prepare_mask_guides_from_directory(
+        video,
+        projection,
+        indexed_masks,
+        zero_based,
+        mask_w,
+        mask_h,
+        stride=stride,
+    )
+    if not guides:
+        raise ValueError('no mask frames selected with the provided stride')
+    return guides
 
 
 def _combine_with_alpha(video: str, reader_config: Dict[str, Any], mask_dir: Path,

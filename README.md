@@ -22,6 +22,12 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
 - Multi-GPU queue manager: the UI container dispatches pending jobs from `/jobs/pending` to worker-specific folders in `/jobs/workers/<id>`.
 - Worker role support: launch additional containers with `VR2AR_ROLE=worker` to consume dispatched jobs on extra GPUs.
 
+## Existing Mask Workflows
+
+- **Stitch Precomputed Masks** – skip MatAnyOne tracking entirely by choosing `Job Mode = stitch` in Stage 4, supplying the path to a directory of combined mask PNGs (e.g. `000001.png`). The worker verifies coverage and directly merges the mask sequence with the source video.
+- **Refine with Existing Masks** – choose `Job Mode = refine` to load a previous mask run as guidance. The worker samples the provided mask directory (respecting the optional stride), recreates stereo key frames and feeds them back through the tracker to regenerate improved masks.
+- Both flows accept absolute or relative paths that are reachable from the container. For refine mode, keeping the stride at `1` uses every available mask; increase the value to thin dense sequences.
+
 ## Multi-GPU Deployment
 
 1. Start the UI/dispatcher as usual: `docker compose up -d` (or the CUDA2 variant).

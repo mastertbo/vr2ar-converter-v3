@@ -33,7 +33,7 @@ import subprocess
 import requests
 import random
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
@@ -53,7 +53,13 @@ from filebrowser_client import FilebrowserClient
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 WORKER_STATUS = "Idle"
-MASK_SIZE = 1440
+MASK_RESOLUTION_PRESETS = {
+    "4K (~3840 width)": 1920,
+    "5K (~5120 width)": 2560,
+    "6K (~6144 width)": 3072,
+}
+MASK_RESOLUTION_DEFAULT = "4K (~3840 width)"
+MASK_SIZE = MASK_RESOLUTION_PRESETS[MASK_RESOLUTION_DEFAULT]
 SECONDS = 10
 WARMUP = 4
 JOB_VERSION = 3
@@ -153,6 +159,23 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
         job_id=job_id,
         job_version=JOB_VERSION,
     )
+
+@torch.no_grad()
+def process_existing_masks(video: str, projection: str, mask_dir: str, crf: int = 16,
+                           job_id: Optional[str] = None) -> str:
+    helpers = {
+        'set_status': _set_worker_status,
+    }
+    return processing_core.stitch_existing_masks(
+        video=video,
+        projection=projection,
+        mask_dir=mask_dir,
+        crf=crf,
+        helpers=helpers,
+        job_id=job_id,
+        job_version=JOB_VERSION,
+    )
+
 
 @torch.no_grad()
 def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = False, force_init_mask=False, job_id: Optional[str] = None):
@@ -536,6 +559,17 @@ def _archive_job_artifacts(job: dict, pkl_path: Path) -> None:
             shutil.move(str(video_path), str(target_video))
         except (FileNotFoundError, shutil.Error) as exc:
             print("Failed to archive source video", video_path, exc)
+    mask_dir = job.get('existing_mask_dir')
+    if mask_dir:
+        mask_path = Path(str(mask_dir))
+        if mask_path.exists() and mask_path.is_dir():
+            target_mask_dir = COMPLETED_JOB_DIR / mask_path.name
+            try:
+                if target_mask_dir.exists():
+                    shutil.rmtree(target_mask_dir)
+                shutil.move(str(mask_path), str(target_mask_dir))
+            except (FileNotFoundError, shutil.Error) as exc:
+                print("Failed to archive mask directory", mask_path, exc)
     try:
         shutil.move(str(pkl_path), str(COMPLETED_JOB_DIR / pkl_path.name))
     except (FileNotFoundError, shutil.Error) as exc:
@@ -554,6 +588,17 @@ def _mark_job_failed(job: dict, pkl_path: Path, error: Exception) -> None:
             shutil.move(str(video_path), str(target_video))
         except (FileNotFoundError, shutil.Error) as exc:
             print("Failed to move failed job video", video_path, exc)
+    mask_dir = job.get('existing_mask_dir')
+    if mask_dir:
+        mask_path = Path(str(mask_dir))
+        if mask_path.exists() and mask_path.is_dir():
+            target_mask_dir = FAILED_JOB_DIR / mask_path.name
+            try:
+                if target_mask_dir.exists():
+                    shutil.rmtree(target_mask_dir)
+                shutil.move(str(mask_path), str(target_mask_dir))
+            except (FileNotFoundError, shutil.Error) as exc:
+                print("Failed to move failed job masks", mask_path, exc)
     try:
         shutil.move(str(pkl_path), str(FAILED_JOB_DIR / pkl_path.name))
     except (FileNotFoundError, shutil.Error) as exc:
@@ -567,6 +612,59 @@ def _mark_job_failed(job: dict, pkl_path: Path, error: Exception) -> None:
 
 
 def _run_job(job: dict) -> Optional[str]:
+    mode = (job.get('job_mode') or 'generate').lower()
+
+    if mode == 'stitch':
+        mask_dir = job.get('existing_mask_dir')
+        if not mask_dir:
+            raise ValueError('existing_mask_dir missing for stitch mode')
+        return process_existing_masks(
+            job['video'],
+            job['projection'],
+            mask_dir,
+            job['crf'],
+            job_id=job.get('job_id'),
+        )
+
+    if mode == 'refine':
+        mask_dir = job.get('existing_mask_dir')
+        if not mask_dir:
+            raise ValueError('existing_mask_dir missing for refine mode')
+        stride = job.get('existing_mask_stride', 1) or 1
+        try:
+            stride_value = int(stride)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('invalid stride value for refine mode') from exc
+        if stride_value < 1:
+            raise ValueError('stride for refine mode must be >= 1')
+
+        _set_worker_status('Prepare mask guides...')
+        masks = processing_core.prepare_masks_from_directory(
+            job['video'],
+            job['projection'],
+            mask_dir,
+            stride=stride_value,
+        )
+        if job.get('reverseTracking'):
+            return process_with_reverse_tracking(
+                job['video'],
+                job['projection'],
+                masks,
+                job['crf'],
+                job['erode'],
+                job['forceInitMask'],
+                job_id=job.get('job_id'),
+            )
+        return process(
+            job['video'],
+            job['projection'],
+            masks,
+            job['crf'],
+            job['erode'],
+            job['forceInitMask'],
+            job_id=job.get('job_id'),
+        )
+
     if job.get('reverseTracking'):
         return process_with_reverse_tracking(
             job['video'],
@@ -622,6 +720,19 @@ def _dispatch_job_to_worker(pkl_path: Path, worker_dir: Path) -> None:
     if video_path.exists():
         shutil.move(str(video_path), str(target_video))
     job['video'] = str(target_video)
+    mask_dir = job.get('existing_mask_dir')
+    if mask_dir:
+        mask_path = Path(str(mask_dir))
+        target_mask_dir = worker_dir / mask_path.name
+        if mask_path.exists() and mask_path.is_dir():
+            try:
+                if target_mask_dir.exists():
+                    shutil.rmtree(target_mask_dir)
+                shutil.move(str(mask_path), str(target_mask_dir))
+            except (FileNotFoundError, shutil.Error) as exc:
+                print('Failed to move mask directory to worker', mask_path, exc)
+            else:
+                job['existing_mask_dir'] = str(target_mask_dir)
     job['assigned_to'] = worker_dir.name
     job['dispatched_at'] = time.time()
     target_pkl = worker_dir / pkl_path.name
@@ -740,48 +851,93 @@ def background_worker():
             time.sleep(1)
 
 
-def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
+def add_job(video, projection, crf, erode, forceInitMask, reverseTracking,
+            job_mode, existing_mask_dir, existing_mask_stride):
     RETURN_VALUES = 16
+    mode = (job_mode or 'generate').lower()
+
     if video is None:
         gr.Warning("Could not add Job: Video not found", duration=5)
         return tuple(gr.skip() for _ in range(RETURN_VALUES))
 
-    if not all(os.path.exists(os.path.join(x, '0000.png')) for x in ["masksL", "masksR"]):
-        gr.Warning("Could not add Job: Mask for first frame does not exists", duration=5)
-        return tuple(gr.skip() for _ in range(RETURN_VALUES))
-
-    masksFiles = sorted([f for f in os.listdir('masksL') if f.endswith(".png") and os.path.exists(os.path.join('masksR', f))])
-    masks = []
-    for f in masksFiles:
-        frame = cv2.imread(os.path.join('frames', f))
-        width = 2*MASK_SIZE
-
-        frameL = frame[:, :int(width/2)]
-        frameR = frame[:, int(width/2):]
-
-        maskL = Image.open(os.path.join('masksL', f)).convert('L')
-        maskR = Image.open(os.path.join('masksR', f)).convert('L')
-
-        grayL = cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY)
-        grayR = cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY)
-
-        masks.append({
-            'maskL': maskL,
-            'maskR': maskR,
-            'frameL': frameL,
-            'frameR': frameR,
-            'frameLGray': grayL,
-            'frameRGray': grayR
-        })
-
-    if len(masks) == 0:
-        gr.Warning("Could not add Job: Mask Missing", duration=5)
-        return tuple(gr.skip() for _ in range(RETURN_VALUES))
-
     ts = str(int(time.time()))
+    masks: List[Dict[str, Any]] = []
+    mask_directory: Optional[Path] = None
+    stride_value = 1
+
+    if mode in ('stitch', 'refine'):
+        if not existing_mask_dir:
+            gr.Warning("Existing mask directory is required for the selected job mode", duration=5)
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
+        source_mask_dir = Path(existing_mask_dir).expanduser()
+        if not source_mask_dir.exists() or not source_mask_dir.is_dir():
+            gr.Warning(f"Mask directory not found: {source_mask_dir}", duration=5)
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
+        png_candidates = list(source_mask_dir.glob('*.png'))
+        if not png_candidates:
+            png_candidates = list(source_mask_dir.glob('*.PNG'))
+        if not png_candidates:
+            gr.Warning("Mask directory does not contain any PNG masks", duration=5)
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
+        if mode == 'refine':
+            try:
+                stride_value = int(existing_mask_stride or 1)
+            except (TypeError, ValueError):
+                gr.Warning("Stride must be an integer >= 1", duration=5)
+                return tuple(gr.skip() for _ in range(RETURN_VALUES))
+            if stride_value < 1:
+                gr.Warning("Stride must be at least 1", duration=5)
+                return tuple(gr.skip() for _ in range(RETURN_VALUES))
+        PENDING_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        mask_dir_name = source_mask_dir.name or 'masks'
+        target_mask_dir = PENDING_JOBS_DIR / f"{ts}_{mask_dir_name}"
+        try:
+            if target_mask_dir.exists():
+                shutil.rmtree(target_mask_dir)
+            shutil.copytree(source_mask_dir, target_mask_dir)
+        except OSError as exc:
+            gr.Warning(f"Failed to stage mask directory: {exc}", duration=5)
+            try:
+                if target_mask_dir.exists():
+                    shutil.rmtree(target_mask_dir)
+            except OSError:
+                pass
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
+        mask_directory = target_mask_dir
+    else:
+        if not all(os.path.exists(os.path.join(x, '0000.png')) for x in ["masksL", "masksR"]):
+            gr.Warning("Could not add Job: Mask for first frame does not exists", duration=5)
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
+
+        masksFiles = sorted([f for f in os.listdir('masksL') if f.endswith(".png") and os.path.exists(os.path.join('masksR', f))])
+        for f in masksFiles:
+            frame = cv2.imread(os.path.join('frames', f))
+            width = 2*MASK_SIZE
+
+            frameL = frame[:, :int(width/2)]
+            frameR = frame[:, int(width/2):]
+
+            maskL = Image.open(os.path.join('masksL', f)).convert('L')
+            maskR = Image.open(os.path.join('masksR', f)).convert('L')
+
+            grayL = cv2.cvtColor(frameL, cv2.COLOR_BGR2GRAY)
+            grayR = cv2.cvtColor(frameR, cv2.COLOR_BGR2GRAY)
+
+            masks.append({
+                'maskL': maskL,
+                'maskR': maskR,
+                'frameL': frameL,
+                'frameR': frameR,
+                'frameLGray': grayL,
+                'frameRGray': grayR
+            })
+
+        if len(masks) == 0:
+            gr.Warning("Could not add Job: Mask Missing", duration=5)
+            return tuple(gr.skip() for _ in range(RETURN_VALUES))
 
     PENDING_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    dest_path = PENDING_JOBS_DIR / f"{ts}_" + os.path.basename(video.name)
+    dest_path = PENDING_JOBS_DIR / f"{ts}_{os.path.basename(video.name)}"
     shutil.move(video.name, str(dest_path))
     job_id = processing_core._compute_job_id(str(dest_path), projection)
 
@@ -794,7 +950,11 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking):
         'masks': masks,
         'erode': erode,
         'forceInitMask': forceInitMask,
-        'reverseTracking': reverseTracking
+        'mask_resolution': MASK_SIZE,
+        'reverseTracking': reverseTracking,
+        'job_mode': mode,
+        'existing_mask_dir': str(mask_directory) if mask_directory else None,
+        'existing_mask_stride': stride_value,
     }
 
     job_pkl_path = PENDING_JOBS_DIR / f"{ts}.pkl"
@@ -855,8 +1015,23 @@ def set_extract_frames_step(x):
     SECONDS = int(x)
     print("set extract seconds to", SECONDS)
 
-def extract_frames(video, projection, mask_size, frames_seconds):
-    set_mask_size(mask_size)
+def resolve_mask_size(choice: Optional[str]) -> int:
+    if not choice:
+        return MASK_RESOLUTION_PRESETS[MASK_RESOLUTION_DEFAULT]
+    return MASK_RESOLUTION_PRESETS.get(choice, MASK_RESOLUTION_PRESETS[MASK_RESOLUTION_DEFAULT])
+
+def describe_mask_resolution(mask_size: int) -> str:
+    total_width = mask_size * 2
+    return f"Mask processing resolution: {total_width}x{mask_size} (per-eye {mask_size}x{mask_size})."
+
+def apply_mask_resolution_preset(choice: Optional[str]) -> str:
+    size = resolve_mask_size(choice)
+    set_mask_size(size)
+    return describe_mask_resolution(size)
+
+def extract_frames(video, projection, mask_resolution_choice, frames_seconds):
+    mask_size_value = resolve_mask_size(mask_resolution_choice)
+    set_mask_size(mask_size_value)
     set_extract_frames_step(frames_seconds)
     for dir in ["frames", "previews", "masksL", 'masksR']:
         if os.path.exists(dir):
@@ -881,7 +1056,7 @@ def extract_frames(video, projection, mask_size, frames_seconds):
         img_scaled = cv2.resize(cv2.imread(frame), (2*MASK_SIZE, MASK_SIZE))
         cv2.imwrite(frame, img_scaled)
 
-    return generate_gallery_list()
+    return generate_gallery_list(), describe_mask_resolution(mask_size_value)
 
 def get_selected(selected):
     global frame_name
@@ -1193,7 +1368,7 @@ with gr.Blocks() as demo:
         Process:
         1. Upload Your video
         2. Select Video Source Format
-        3. Select Mask Size (Higher value require more VRAM!)
+        3. Select Mask Downscale (higher values require more VRAM)
         3. Extract Frames
         4. Generate Initial Mask. Use Points or Prompts to generate individual Masks and merge them with add or subtract button to the initial mask. To create a second mask with points you have to use the crea button to select the points for the next partial mask. Use the foreground and subtract to remove areas from mask. use foreground and add to add areas to the inital mask. You can also try to specify additional backrground points but for me this always results in worse results.
         5. Add Video Mask Job
@@ -1202,19 +1377,25 @@ with gr.Blocks() as demo:
         gr.Markdown("## Stage 1 - Video")
         input_video = gr.File(label="Upload Video (MKV or MP4)", file_types=["mkv", "mp4", "video"])
         projection_dropdown = gr.Dropdown(choices=["eq", "fisheye180", "fisheye190", "fisheye200"], label="VR Video Source Format", value="eq")
-        mask_size = gr.Number(
-            label="Mask Size (Mask Size larger than 40% of video height make no sense, higher mask value require more VRAM, 1440 require approx. 20GB VRAM)",
-            minimum=512,
-            maximum=2048,
-            step=1,
-            value=MASK_SIZE
+        mask_resolution_choice = gr.Radio(
+            choices=list(MASK_RESOLUTION_PRESETS.keys()),
+            label="Mask Processing Downscale",
+            value=MASK_RESOLUTION_DEFAULT,
+            info="Adjust mask processing width; higher values increase GPU load."
         )
+        mask_resolution_info = gr.Markdown(describe_mask_resolution(MASK_SIZE))
         extract_frames_step = gr.Number(
             label="Extract frames every x seconds",
             minimum=0,
             maximum=600,
             step=1,
             value=SECONDS
+        )
+
+        mask_resolution_choice.change(
+            fn=apply_mask_resolution_preset,
+            inputs=[mask_resolution_choice],
+            outputs=[mask_resolution_info]
         )
 
     with gr.Column():
@@ -1381,8 +1562,8 @@ with gr.Blocks() as demo:
 
         frame_button.click(
             fn=extract_frames,
-            inputs=[input_video, projection_dropdown, mask_size, extract_frames_step],
-            outputs=[gallery]
+            inputs=[input_video, projection_dropdown, mask_resolution_choice, extract_frames_step],
+            outputs=[gallery, mask_resolution_info]
         )
 
         selected_frame = gr.State(None)
@@ -1432,10 +1613,27 @@ with gr.Blocks() as demo:
         erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=True, info="")
         force_init_mask_checkbox = gr.Checkbox(label="Force Init Mask", value=False, info="")
         reverse_tracking_checkbox = gr.Checkbox(label="Reverse Tracking (caches mask for all frames inside /app/process until completed!)", value=True, info="")
+        job_mode_radio = gr.Radio(
+            choices=["generate", "refine", "stitch"],
+            value="generate",
+            label="Job Mode",
+            info="generate: track with current manual keyframes; refine: reuse an existing mask directory as guides; stitch: skip tracking and merge video with an existing mask sequence"
+        )
+        existing_mask_dir_input = gr.Textbox(
+            label="Existing Mask Directory",
+            placeholder="Path containing combined mask PNGs (e.g. 000001.png)",
+            value=""
+        )
+        existing_mask_stride_input = gr.Number(
+            label="Guide Stride (refine mode)",
+            value=1,
+            minimum=1,
+            step=1
+        )
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox, force_init_mask_checkbox, reverse_tracking_checkbox],
+            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox, force_init_mask_checkbox, reverse_tracking_checkbox, job_mode_radio, existing_mask_dir_input, existing_mask_stride_input],
             outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMask, exampleL, exampleR, postprocessedMaskL, postprocessedMaskR]
         )
 
@@ -1499,8 +1697,3 @@ if __name__ == "__main__":
         run_worker()
     else:
         run_ui()
-
-
-
-
-

@@ -1,8 +1,8 @@
 services:
   vr2ar:
-    # build:
-    #  context: .
-    image: "ghcr.io/mastertbo/vr2ar-converter-v3:dispatch-worker"
+    build:
+      context: .
+    image: vr2ar-converter-v3:local
     deploy:
       resources:
         reservations:
@@ -22,7 +22,7 @@ services:
 
   vr2ar-worker:
     profiles: ["worker"]
-    image: "ghcr.io/mastertbo/vr2ar-converter-v3:dispatch-worker"
+    image: vr2ar-converter-v3:local
     deploy:
       resources:
         reservations:
@@ -41,6 +41,6 @@ services:
 
 volumes:
   vr2ar:
-    external: true
+
   process-cache:
 
