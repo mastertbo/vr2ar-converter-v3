@@ -288,6 +288,27 @@ def sam_segment_points(sam_model, image, prompt_points):
     return img, masks[0]
 
 
+_grounding_segment_cache = None
+_point_segment_cache = None
+
+
+def get_grounding_segment() -> "GroundingDinoSAM2Segment":
+    global _grounding_segment_cache
+    if _grounding_segment_cache is None:
+        print('[sam2] Loading GroundingDINO + SAM2 models...', flush=True)
+        _grounding_segment_cache = GroundingDinoSAM2Segment()
+        print('[sam2] Models ready', flush=True)
+    return _grounding_segment_cache
+
+def get_point_segment() -> "SAM2PointSegment":
+    global _point_segment_cache
+    if _point_segment_cache is None:
+        print('[sam2] Loading SAM2 point-seg model...', flush=True)
+        _point_segment_cache = SAM2PointSegment()
+        print('[sam2] Point-seg model ready', flush=True)
+    return _point_segment_cache
+
+
 class GroundingDinoSAM2Segment:
     def __init__(self):
         self.grounding_dino_model = load_groundingdino_model("GroundingDINO_SwinB (938MB)")
