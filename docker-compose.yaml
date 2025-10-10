@@ -2,7 +2,7 @@ services:
   vr2ar:
     build:
       context: .
-    image: vr2ar-converter-v3:local
+    image: mastertbo/vr2arconverterv32:latest
     deploy:
       resources:
         reservations:
@@ -22,7 +22,7 @@ services:
 
   vr2ar-worker:
     profiles: ["worker"]
-    image: vr2ar-converter-v3:local
+    image: mastertbo/vr2arconverterv32:latest
     deploy:
       resources:
         reservations:

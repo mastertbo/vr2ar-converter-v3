@@ -32,9 +32,12 @@ import asyncio
 import subprocess
 import requests
 import random
+import copy
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from sam2_executor import GroundingDinoSAM2Segment, SAM2PointSegment
+from datetime import datetime
+from sam2_executor import get_grounding_segment, get_point_segment
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 
@@ -81,6 +84,14 @@ def _ensure_base_dirs() -> None:
 
 
 _ensure_base_dirs()
+
+try:
+    _BLOCKS_KWARGS: Dict[str, Any] = {}
+    blocks_signature = inspect.signature(gr.Blocks.__init__)
+    if 'allowed_paths' in blocks_signature.parameters:
+        _BLOCKS_KWARGS['allowed_paths'] = [str(COMPLETED_JOB_DIR)]
+except (ValueError, TypeError, AttributeError):
+    _BLOCKS_KWARGS = {}
 
 def _set_worker_status(message: str) -> None:
     global WORKER_STATUS
@@ -220,17 +231,12 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 
     result_name = file_name + "_" + str(projection_out).upper() + "_alpha" + file_extension
 
-    matanyone1 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
+    base_model = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
     if torch.torch.cuda.is_available():
-        matanyone1 = matanyone1.cuda()
-    matanyone1 = matanyone1.eval()
-    processor1 = InferenceCore(matanyone1, cfg=matanyone1.cfg)
-
-    matanyone2 = MatAnyone.from_pretrained("PeiqingYang/MatAnyone")
-    if torch.torch.cuda.is_available():
-        matanyone2 = matanyone2.cuda()
-    matanyone2 = matanyone2.eval()
-    processor2 = InferenceCore(matanyone2, cfg=matanyone2.cfg)
+        base_model = base_model.cuda()
+    base_model = base_model.eval()
+    processor1 = InferenceCore(base_model, cfg=copy.deepcopy(base_model.cfg))
+    processor2 = InferenceCore(base_model, cfg=copy.deepcopy(base_model.cfg))
 
     for i in range(len(masks)):
         imgLV = prepare_frame(masks[i]['frameL'], has_cuda)
@@ -330,54 +336,58 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
             imgLV_end = imgLV
             imgRV_end = imgRV
             reverse_track = False
-            frame_files = sorted(['process/frames/' + f for f in os.listdir('process/frames/') if f.endswith(".png")],  reverse=True)
+            frame_files = sorted(
+                ['process/frames/' + f for f in os.listdir('process/frames/') if f.endswith(".png")],
+                reverse=True,
+            )
             subprocess_len = len(frame_files)
-            for idx, frame_file in enumerate(frame_files):
-                img_scaled = cv2.imread(frame_file)
-                os.remove(frame_file)
+            if subprocess_len > 0:
+                for idx, frame_file in enumerate(frame_files):
+                    img_scaled = cv2.imread(frame_file)
+                    os.remove(frame_file)
 
-                _, width = img_scaled.shape[:2]
-                imgL = img_scaled[:, :int(width/2)]
-                imgR = img_scaled[:, int(width/2):]
+                    _, width = img_scaled.shape[:2]
+                    imgL = img_scaled[:, :int(width/2)]
+                    imgR = img_scaled[:, int(width/2):]
 
-                imgLV = prepare_frame(imgL, has_cuda)
-                imgRV = prepare_frame(imgR, has_cuda)
+                    imgLV = prepare_frame(imgL, has_cuda)
+                    imgRV = prepare_frame(imgR, has_cuda)
 
-                output_prob_L = processor1.step(imgLV)
-                output_prob_R = processor2.step(imgRV)
-                WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length} - Subprocess {idx}/{subprocess_len}"
+                    output_prob_L = processor1.step(imgLV)
+                    output_prob_R = processor2.step(imgRV)
+                    WORKER_STATUS = f"Create Mask {current_frame}/{video_info.length} - Subprocess {idx}/{subprocess_len}"
 
-                mask_output_L = processor1.output_prob_to_mask(output_prob_L)
-                mask_output_R = processor2.output_prob_to_mask(output_prob_R)
+                    mask_output_L = processor1.output_prob_to_mask(output_prob_L)
+                    mask_output_R = processor2.output_prob_to_mask(output_prob_R)
 
-                mask_output_L_pha = mask_output_L.unsqueeze(2).cpu().detach().numpy()
-                mask_output_R_pha = mask_output_R.unsqueeze(2).cpu().detach().numpy()
+                    mask_output_L_pha = mask_output_L.unsqueeze(2).cpu().detach().numpy()
+                    mask_output_R_pha = mask_output_R.unsqueeze(2).cpu().detach().numpy()
 
-                mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
-                mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
+                    mask_output_L_pha = (mask_output_L_pha*255).astype(np.uint8)
+                    mask_output_R_pha = (mask_output_R_pha*255).astype(np.uint8)
 
-                combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
-                maskA = cv2.imread(frame_file.replace('frames', 'masks'), cv2.IMREAD_UNCHANGED)
-                
-                if MASK_DEBUG:
-                    cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_rev.png'), combined_mask)
-                
-                # using avg or other merge gives much worse reults at edges
-                mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
+                    combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
+                    maskA = cv2.imread(frame_file.replace('frames', 'masks'), cv2.IMREAD_UNCHANGED)
 
-                cv2.imwrite(frame_file.replace('frames', 'masks'), mergedA)
-                if MASK_DEBUG:
-                    cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_res.png'), mergedA)
+                    if MASK_DEBUG:
+                        cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_rev.png'), combined_mask)
 
-            print("reverse tracking of", subprocess_len, "completed")
-            # set model state to forware tracking again
-            imgLMask = fix_mask2(masks[maskIdx-1]['maskL'])
-            imgRMask = fix_mask2(masks[maskIdx-1]['maskR'])
-            output_prob_L = processor1.step(imgLV_end, imgLMask, objects=objects)
-            output_prob_R = processor2.step(imgRV_end, imgRMask, objects=objects)
-            for _ in range(WARMUP):
-                output_prob_L = processor1.step(imgLV_end)
-                output_prob_R = processor2.step(imgRV_end)
+                    # using avg or other merge gives much worse reults at edges
+                    mergedA = np.bitwise_or(np.array(maskA), np.array(combined_mask))
+
+                    cv2.imwrite(frame_file.replace('frames', 'masks'), mergedA)
+                    if MASK_DEBUG:
+                        cv2.imwrite(frame_file.replace('frames', 'debug').replace('.png', '_res.png'), mergedA)
+
+                print("reverse tracking of", subprocess_len, "completed")
+                # set model state to forware tracking again
+                imgLMask = fix_mask2(masks[maskIdx-1]['maskL'])
+                imgRMask = fix_mask2(masks[maskIdx-1]['maskR'])
+                output_prob_L = processor1.step(imgLV_end, imgLMask, objects=objects)
+                output_prob_R = processor2.step(imgRV_end, imgRMask, objects=objects)
+                for _ in range(WARMUP):
+                    output_prob_L = processor1.step(imgLV_end)
+                    output_prob_R = processor2.step(imgRV_end)
         
         gc.collect()
 
@@ -387,8 +397,7 @@ def process_with_reverse_tracking(video, projection, masks, crf = 16, erode = Fa
 
     del processor1
     del processor2
-    del matanyone1
-    del matanyone2
+    del base_model
 
     if torch.torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -516,6 +525,125 @@ def _persist_result(result_path: Optional[str]) -> Optional[str]:
         except Exception as copy_exc:
             print("Failed to copy result to completed folder", copy_exc)
             return str(src)
+
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(max(num_bytes, 0))
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+
+def _normalize_tracked_dirs(directories: Optional[List[str]]) -> List[str]:
+    if not directories:
+        return []
+    normalized = []
+    for directory in directories:
+        if not directory:
+            continue
+        path = Path(directory)
+        if path.exists() and path.is_dir():
+            normalized.append(str(path))
+    return sorted(set(normalized))
+
+
+def _collect_tracked_files(directories: Optional[List[str]]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    now = time.time()
+    for directory in _normalize_tracked_dirs(directories):
+        dir_path = Path(directory)
+        try:
+            entries = list(dir_path.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.exists() or not entry.is_file():
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            age_minutes = max(0, int((now - stat.st_mtime) / 60))
+            age_display = f"{age_minutes} min" if age_minutes else "<1 min"
+            rows.append([
+                entry.name,
+                _format_bytes(stat.st_size),
+                modified,
+                age_display,
+                str(entry),
+            ])
+    rows.sort(key=lambda row: row[-1])
+    return rows
+
+
+def _tracked_file_choices(directories: Optional[List[str]]) -> List[str]:
+    choices: List[str] = []
+    for directory in _normalize_tracked_dirs(directories):
+        dir_path = Path(directory)
+        try:
+            entries = list(dir_path.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.exists() and entry.is_file():
+                choices.append(str(entry))
+    return sorted(set(choices))
+
+
+def _register_temp_directory(directories: Optional[List[str]], file_path: Optional[str]) -> List[str]:
+    tracked = set(_normalize_tracked_dirs(directories))
+    if not file_path:
+        return sorted(tracked)
+    path = Path(file_path)
+    parent = path.parent
+    tracked.add(str(parent))
+    grandparent = parent.parent
+    if grandparent.name.startswith("gradio"):
+        tracked.add(str(grandparent))
+    return sorted(tracked)
+
+
+def _refresh_tracked_view(directories: Optional[List[str]]):
+    normalized = _normalize_tracked_dirs(directories)
+    rows = _collect_tracked_files(normalized)
+    choices = _tracked_file_choices(normalized)
+    return normalized, rows, gr.update(choices=choices, value=[])
+
+
+def refresh_tracked_files(directories: Optional[List[str]]):
+    return _refresh_tracked_view(directories)
+
+
+def register_uploaded_file(file_obj, directories: Optional[List[str]]):
+    file_path = getattr(file_obj, "name", None)
+    updated_dirs = _register_temp_directory(directories, file_path)
+    return _refresh_tracked_view(updated_dirs)
+
+
+def delete_tracked_files(selected: Optional[List[str]], directories: Optional[List[str]]):
+    failed = 0
+    total = len(selected or [])
+    for path_str in selected or []:
+        try:
+            path = Path(path_str)
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+        except OSError:
+            failed += 1
+    if failed:
+        gr.Warning(f"Failed to remove {failed} item(s); check server logs for details.", duration=5)
+    elif total:
+        gr.Info(f"Removed {total} item(s).", duration=3)
+    return _refresh_tracked_view(directories)
 
 
 def _run_filebrowser_upload(result_path: Optional[str]) -> None:
@@ -1029,32 +1157,135 @@ def apply_mask_resolution_preset(choice: Optional[str]) -> str:
     set_mask_size(size)
     return describe_mask_resolution(size)
 
+def _run_ffmpeg_command(args: List[str], step: str, allow_empty_output: bool = False) -> None:
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stderr = (result.stderr or '').strip()
+    if result.returncode != 0:
+        if allow_empty_output and 'Output file is empty' in stderr:
+            return
+        message = stderr or f'ffmpeg exited with status {result.returncode}'
+        print(f"FFmpeg {step} failed: {message}")
+        raise gr.Error(f"FFmpeg could not {step}. {message}")
+
+
+def _strip_hwaccel(args: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    skip_next = False
+    for token in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == '-hwaccel':
+            skip_next = True
+            continue
+        cleaned.append(token)
+    return cleaned
+
+
+def _run_ffmpeg_command_with_fallback(args: List[str], step: str, allow_empty_output: bool = False) -> None:
+    try:
+        _run_ffmpeg_command(args, step, allow_empty_output)
+        return
+    except gr.Error as error:
+        if '-hwaccel' not in args:
+            raise
+        message = str(error)
+        print(f"FFmpeg {step} retrying without hwaccel due to: {message}")
+        fallback_args = _strip_hwaccel(args)
+        _run_ffmpeg_command(fallback_args, step, allow_empty_output)
+
+
 def extract_frames(video, projection, mask_resolution_choice, frames_seconds):
+    if video is None:
+        raise gr.Error('Please upload a video before extracting frames.')
+
+    video_path = getattr(video, 'name', None)
+    if not video_path or not os.path.exists(video_path):
+        raise gr.Error('Uploaded video file is no longer available on disk.')
+
     mask_size_value = resolve_mask_size(mask_resolution_choice)
     set_mask_size(mask_size_value)
     set_extract_frames_step(frames_seconds)
-    for dir in ["frames", "previews", "masksL", 'masksR']:
-        if os.path.exists(dir):
-            shutil.rmtree(dir)
 
-        os.makedirs(dir, exist_ok=True)
+    for dir_name in ['frames', 'previews', 'masksL', 'masksR']:
+        dir_path = Path(dir_name)
+        if dir_path.exists():
+            shutil.rmtree(dir_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
 
-    if str(projection) == "eq":
-        filter_complex = "split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; [right]crop=ih:ih:ih:0[right_crop]; [left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; [right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; [leftfisheye][rightfisheye]hstack[v]"
-        os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -frames:v 1 -filter_complex \"[0:v]{filter_complex}\" -map \"[v]\" frames/0000.png")
+    ffmpeg_binary = FFmpegStream.get_ffmpeg_command()
+    frames_dir = Path('frames')
+    first_frame_path = frames_dir / '0000.png'
+    projection_value = str(projection)
+
+    if projection_value == 'eq':
+        filter_complex = (
+            'split=2[left][right]; [left]crop=ih:ih:0:0[left_crop]; ' 
+            '[right]crop=ih:ih:ih:0[right_crop]; ' 
+            '[left_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[leftfisheye]; ' 
+            '[right_crop]v360=hequirect:fisheye:iv_fov=180:ih_fov=180:v_fov=180:h_fov=180[rightfisheye]; ' 
+            '[leftfisheye][rightfisheye]hstack[v]'
+        )
+
+        first_frame_cmd = [
+            ffmpeg_binary,
+            '-hide_banner', '-loglevel', 'warning',
+            '-hwaccel', 'auto',
+            '-i', video_path,
+            '-frames:v', '1',
+            '-filter_complex', f"[0:v]{filter_complex}",
+            '-map', '[v]',
+            str(first_frame_path),
+        ]
+        _run_ffmpeg_command_with_fallback(first_frame_cmd, 'extract the first projection frame')
+
         if SECONDS > 0:
-            os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -filter_complex \"[0:v]fps=1/{SECONDS},{filter_complex}\" -map \"[v]\" -start_number 1 frames/%04d.png")
+            sequence_cmd = [
+                ffmpeg_binary,
+                '-hide_banner', '-loglevel', 'warning',
+                '-hwaccel', 'auto',
+                '-i', video_path,
+                '-filter_complex', f"[0:v]fps=1/{SECONDS},{filter_complex}",
+                '-map', '[v]',
+                '-start_number', '1',
+                str(frames_dir / '%04d.png'),
+            ]
+            _run_ffmpeg_command_with_fallback(sequence_cmd, 'extract additional projection frames', allow_empty_output=True)
     else:
-        os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -frames:v 1 -pix_fmt bgr24 frames/0000.png")
-        if SECONDS > 0:
-            os.system(f"ffmpeg -hide_banner -loglevel warning -hwaccel auto -i \"{video.name}\" -vf fps=1/{SECONDS} -pix_fmt bgr24 -start_number 1 frames/%04d.png")
-    
-    frames = [os.path.join('frames', f) for f in os.listdir('frames') if f.endswith(".png")]
+        first_frame_cmd = [
+            ffmpeg_binary,
+            '-hide_banner', '-loglevel', 'warning',
+            '-hwaccel', 'auto',
+            '-i', video_path,
+            '-frames:v', '1',
+            '-pix_fmt', 'bgr24',
+            str(first_frame_path),
+        ]
+        _run_ffmpeg_command_with_fallback(first_frame_cmd, 'extract the first projection frame')
 
-    #NOTE: use same method for resizing to get pixel exact matches
-    for frame in frames:
-        img_scaled = cv2.resize(cv2.imread(frame), (2*MASK_SIZE, MASK_SIZE))
-        cv2.imwrite(frame, img_scaled)
+        if SECONDS > 0:
+            sequence_cmd = [
+                ffmpeg_binary,
+                '-hide_banner', '-loglevel', 'warning',
+                '-hwaccel', 'auto',
+                '-i', video_path,
+                '-vf', f'fps=1/{SECONDS}',
+                '-pix_fmt', 'bgr24',
+                '-start_number', '1',
+                str(frames_dir / '%04d.png'),
+            ]
+            _run_ffmpeg_command_with_fallback(sequence_cmd, 'extract additional projection frames', allow_empty_output=True)
+
+    if not first_frame_path.exists():
+        raise gr.Error('Failed to extract a preview frame. Check the video source and try again.')
+
+    frame_files = sorted(frames_dir.glob('*.png'))
+    for frame_path in frame_files:
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            continue
+        img_scaled = cv2.resize(img, (2 * MASK_SIZE, MASK_SIZE))
+        cv2.imwrite(str(frame_path), img_scaled)
 
     return generate_gallery_list(), describe_mask_resolution(mask_size_value)
 
@@ -1100,7 +1331,7 @@ def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThre
     if frameL is None or frameR is None:
         return None, None, None, None
 
-    sam2 = GroundingDinoSAM2Segment()
+    sam2 = get_grounding_segment()
 
     if len( maskLPrompt) > 0: 
         (_, imgLMask) = sam2.predict([frameL], maskLThreshold, maskLPrompt)
@@ -1141,7 +1372,6 @@ def get_mask(frameL, frameR, maskLPrompt, maskRPrompt, maskLThreshold, maskRThre
         previewR = frameR
         maskR = Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L")
 
-    del sam2
     
     return previewL, maskL, previewR, maskR
 
@@ -1162,7 +1392,7 @@ def get_mask2():
     for x, y, label in current_origin_frame['R'].point_set:
         pointsR.append(((x, y), label))
 
-    sam2 = SAM2PointSegment()
+    sam2 = get_point_segment()
 
     if len(pointsL) != 0:
         (_, imgLMask) = sam2.predict(frameL, pointsL)
@@ -1191,7 +1421,6 @@ def get_mask2():
         previewR = frameR
         maskR = Image.fromarray(np.zeros([MASK_SIZE, MASK_SIZE, 3], dtype=np.uint8)).convert("L") 
 
-    del sam2
 
     return previewL, maskL, previewR, maskR
 
@@ -1362,7 +1591,7 @@ def run_worker() -> None:
             _write_worker_status(worker_dir, 'idle')
             time.sleep(1)
 
-with gr.Blocks() as demo:
+with gr.Blocks(**_BLOCKS_KWARGS) as demo:
     gr.Markdown("# Video VR2AR Converter")
     gr.Markdown('''
         Process:
@@ -1373,6 +1602,7 @@ with gr.Blocks() as demo:
         4. Generate Initial Mask. Use Points or Prompts to generate individual Masks and merge them with add or subtract button to the initial mask. To create a second mask with points you have to use the crea button to select the points for the next partial mask. Use the foreground and subtract to remove areas from mask. use foreground and add to add areas to the inital mask. You can also try to specify additional backrground points but for me this always results in worse results.
         5. Add Video Mask Job
     ''')
+    tracked_temp_dirs = gr.State([])
     with gr.Column():
         gr.Markdown("## Stage 1 - Video")
         input_video = gr.File(label="Upload Video (MKV or MP4)", file_types=["mkv", "mp4", "video"])
@@ -1641,6 +1871,17 @@ with gr.Blocks() as demo:
         gr.Markdown("## Job Control")
         schedule_checkbox = gr.Checkbox(label="Enable Job Scheduling", value=SCHEDULE, info="")
         ignore_surplus_checkbox = gr.Checkbox(label="Ignore Surplus Scheduling", value=SURPLUS_IGNORE, info="")
+        with gr.Accordion("Upload Storage Monitor", open=False):
+            gr.Markdown("Inspect uploaded temporary files before clearing them.")
+            upload_file_table = gr.Dataframe(
+                headers=["Filename", "Size", "Modified", "Age", "Path"],
+                interactive=False,
+                value=[],
+            )
+            temp_file_selector = gr.CheckboxGroup(label="Select uploads to delete", choices=[])
+            with gr.Row():
+                refresh_uploads_button = gr.Button("Refresh Upload List")
+                delete_uploads_button = gr.Button("Delete Selected Uploads")
         clear_completed_jobs_button = gr.Button("Clear completed Jobs")
         restart_button = gr.Button("CLEANUP AND RESTART".upper())
 
@@ -1653,6 +1894,18 @@ with gr.Blocks() as demo:
 
         clear_completed_jobs_button.click(
             fn=clear_completed_jobs
+        )
+
+        refresh_uploads_button.click(
+            fn=refresh_tracked_files,
+            inputs=[tracked_temp_dirs],
+            outputs=[tracked_temp_dirs, upload_file_table, temp_file_selector],
+        )
+
+        delete_uploads_button.click(
+            fn=delete_tracked_files,
+            inputs=[temp_file_selector, tracked_temp_dirs],
+            outputs=[tracked_temp_dirs, upload_file_table, temp_file_selector],
         )
 
         schedule_checkbox.change(
@@ -1670,6 +1923,17 @@ with gr.Blocks() as demo:
         status = gr.Textbox(label="Status", lines=2)
         output_videos = gr.File(value=[], label="Download AR Videos", visible=True)
         
+        input_video.upload(
+            fn=register_uploaded_file,
+            inputs=[input_video, tracked_temp_dirs],
+            outputs=[tracked_temp_dirs, upload_file_table, temp_file_selector],
+        )
+
+        input_video.clear(
+            fn=refresh_tracked_files,
+            inputs=[tracked_temp_dirs],
+            outputs=[tracked_temp_dirs, upload_file_table, temp_file_selector],
+        )
 
     timer1 = gr.Timer(2, active=True)
     timer5 = gr.Timer(5, active=True)
@@ -1697,3 +1961,5 @@ if __name__ == "__main__":
         run_worker()
     else:
         run_ui()
+
+
