@@ -21,6 +21,7 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
 - Checkpointed processing: resumable mask generation is stored under `/app/process` (backed by the `process-cache` volume) for safe crash recovery.
 - Multi-GPU queue manager: the UI container dispatches pending jobs from `/jobs/pending` to worker-specific folders in `/jobs/workers/<id>`.
 - Worker role support: launch additional containers with `VR2AR_ROLE=worker` to consume dispatched jobs on extra GPUs.
+- Flexible mask resolution presets: choose 1K, 2K, 4K, 5K, or 6K masks to balance quality against GPU memory requirements.
 
 ## Existing Mask Workflows
 

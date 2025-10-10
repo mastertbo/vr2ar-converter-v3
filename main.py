@@ -57,6 +57,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 WORKER_STATUS = "Idle"
 MASK_RESOLUTION_PRESETS = {
+    "1K (~1024 width)": 512,
+    "2K (~2048 width)": 1024,
     "4K (~3840 width)": 1920,
     "5K (~5120 width)": 2560,
     "6K (~6144 width)": 3072,
