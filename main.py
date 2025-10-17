@@ -91,7 +91,15 @@ try:
     _BLOCKS_KWARGS: Dict[str, Any] = {}
     blocks_signature = inspect.signature(gr.Blocks.__init__)
     if 'allowed_paths' in blocks_signature.parameters:
-        _BLOCKS_KWARGS['allowed_paths'] = [str(COMPLETED_JOB_DIR)]
+        allowed_roots = {
+            COMPLETED_JOB_DIR,
+            PENDING_JOBS_DIR,
+            WORKERS_DIR,
+            FAILED_JOB_DIR,
+            COMPLETED_JOB_DIR.parent,
+            Path('/app/process'),
+        }
+        _BLOCKS_KWARGS['allowed_paths'] = [str(path) for path in sorted({p.resolve() for p in allowed_roots})]
 except (ValueError, TypeError, AttributeError):
     _BLOCKS_KWARGS = {}
 
