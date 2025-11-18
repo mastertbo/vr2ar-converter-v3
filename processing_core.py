@@ -6,8 +6,9 @@ import hashlib
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -19,12 +20,308 @@ from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from matanyone.inference.inference_core import InferenceCore
 from matanyone.model.matanyone import MatAnyone
+from sam2.build_sam import build_sam2_video_predictor
 from progress_tracker import ProcessingProgress
 
 
 Helpers = Dict[str, Callable[..., Any]]
 
+
+class MaskBackend:
+    """Abstract mask backend interface."""
+
+    mask_idx: int = 0
+
+    def warm_up(self) -> None:
+        """Prepare backend state before processing starts."""
+
+    def get_mask(self, frame_idx: int, frame_rgb: np.ndarray) -> Optional[np.ndarray]:
+        """Return mask for the frame (uint8 2D) or None to skip."""
+        raise NotImplementedError
+
+    def finalize(self) -> None:
+        """Cleanup resources."""
+
+
+@dataclass
+class MaskBackendConfig:
+    mask_backend: str = "matanyone"
+    mask_infer_max_side: int = 2048
+    sam2_config_path: Optional[str] = None
+    sam2_checkpoint_path: Optional[str] = None
+
 _MODEL_CACHE: Dict[str, MatAnyone] = {}
+
+
+class MatAnyOneBackend(MaskBackend):
+    def __init__(
+        self,
+        *,
+        prepared_masks: List[Dict[str, Any]],
+        mask_dir: Path,
+        mask_w: int,
+        mask_h: int,
+        reader_config: Dict[str, Any],
+        has_cuda: bool,
+        resume_frame: int,
+        initial_mask_idx: int,
+        warmup: int,
+        ssim_threshold: float,
+        erode: bool,
+        video: str,
+        objects: List[int],
+        prepare_frame: Callable[[np.ndarray, bool], torch.Tensor],
+        fix_mask2: Callable[[Image.Image], torch.Tensor],
+        force_init_mask: bool,
+    ) -> None:
+        self.prepared_masks = prepared_masks
+        self.mask_dir = mask_dir
+        self.mask_w = mask_w
+        self.mask_h = mask_h
+        self.reader_config = reader_config
+        self.has_cuda = has_cuda
+        self.resume_frame = resume_frame
+        self.mask_idx = initial_mask_idx
+        self.warmup = warmup
+        self.ssim_threshold = ssim_threshold
+        self.erode = erode
+        self.video = video
+        self.objects = objects
+        self.prepare_frame = prepare_frame
+        self.fix_mask2 = fix_mask2
+        self.force_init_mask = force_init_mask
+
+        self.processor_left: Optional[InferenceCore] = None
+        self.processor_right: Optional[InferenceCore] = None
+
+    def warm_up(self) -> None:
+        self.processor_left = _create_processor(self.has_cuda)
+        self.processor_right = _create_processor(self.has_cuda)
+
+        for idx in range(self.mask_idx):
+            entry = self.prepared_masks[idx]
+            self.processor_left.step(entry['imgLV'], entry['maskL'], objects=self.objects, force_permanent=True)
+            self.processor_right.step(entry['imgRV'], entry['maskR'], objects=self.objects, force_permanent=True)
+
+        _warm_start(
+            self.processor_left,
+            self.processor_right,
+            self.video,
+            self.reader_config,
+            self.resume_frame,
+            self.mask_w,
+            self.mask_h,
+            self.has_cuda,
+            self.objects,
+            self.mask_dir,
+            self.prepare_frame,
+            self.fix_mask2,
+            self.warmup,
+        )
+
+    def get_mask(self, frame_idx: int, frame_rgb: np.ndarray) -> Optional[np.ndarray]:
+        if self.processor_left is None or self.processor_right is None:
+            raise RuntimeError('MatAnyOne backend not initialized')
+
+        imgL = frame_rgb[:, :self.mask_w]
+        imgR = frame_rgb[:, self.mask_w:]
+
+        imgLV = self.prepare_frame(imgL, self.has_cuda)
+        imgRV = self.prepare_frame(imgR, self.has_cuda)
+
+        frame_match = False
+        if self.mask_idx < len(self.prepared_masks):
+            entry = self.prepared_masks[self.mask_idx]
+            if ssim(entry['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > self.ssim_threshold:
+                if ssim(entry['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > self.ssim_threshold:
+                    frame_match = True
+
+        if self.force_init_mask and frame_idx == 1:
+            frame_match = True
+
+        if frame_match:
+            entry = self.prepared_masks[self.mask_idx]
+            self.mask_idx += 1
+            output_prob_L = self.processor_left.step(imgLV, entry['maskL'], objects=self.objects)
+            output_prob_R = self.processor_right.step(imgRV, entry['maskR'], objects=self.objects)
+            for _ in range(max(self.warmup, 1)):
+                output_prob_L = self.processor_left.step(imgLV, first_frame_pred=self.mask_idx == 1)
+                output_prob_R = self.processor_right.step(imgRV, first_frame_pred=self.mask_idx == 1)
+        elif self.mask_idx > 0:
+            output_prob_L = self.processor_left.step(imgLV)
+            output_prob_R = self.processor_right.step(imgRV)
+        else:
+            return None
+
+        mask_output_L = self.processor_left.output_prob_to_mask(output_prob_L)
+        mask_output_R = self.processor_right.output_prob_to_mask(output_prob_R)
+
+        mask_output_L_pha = (mask_output_L.unsqueeze(2).cpu().detach().numpy() * 255).astype(np.uint8)
+        mask_output_R_pha = (mask_output_R.unsqueeze(2).cpu().detach().numpy() * 255).astype(np.uint8)
+
+        if self.erode:
+            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3, 3), iterations=1)
+            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3, 3), iterations=1)
+
+        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
+        return combined_mask
+
+    def finalize(self) -> None:
+        self.processor_left = None
+        self.processor_right = None
+
+
+class Sam2Backend(MaskBackend):
+    def __init__(
+        self,
+        *,
+        video: str,
+        resume_frame: int,
+        video_width: int,
+        video_height: int,
+        infer_max_side: int,
+        sam2_config_path: str,
+        sam2_checkpoint_path: str,
+        blur: bool = True,
+        initial_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        self.video = video
+        self.video_width = video_width
+        self.video_height = video_height
+        self.infer_max_side = infer_max_side
+        self.sam2_config_path = sam2_config_path
+        self.sam2_checkpoint_path = sam2_checkpoint_path
+        self.blur = blur
+        self.initial_mask = initial_mask
+        self.predictor = None
+        self.inference_state = None
+        self.tracking_iter: Optional[Iterable[Tuple[int, List[int], torch.Tensor]]] = None
+        self.mask_idx = 0
+        self.start_frame_idx = max(resume_frame, 0)
+
+    def _effective_image_size(self) -> Optional[int]:
+        if not self.infer_max_side:
+            return None
+        max_side = max(self.video_width or 0, self.video_height or 0)
+        if max_side <= 0:
+            return None
+        return min(self.infer_max_side, max_side)
+
+    def warm_up(self) -> None:
+        def _oom_safe_predictor() -> torch.nn.Module:
+            candidates: List[Optional[int]] = []
+            effective_size = self._effective_image_size()
+            if effective_size:
+                size = effective_size
+                while size >= 512:
+                    candidates.append(size)
+                    next_size = size // 2
+                    if next_size == size:
+                        break
+                    size = next_size
+            candidates.append(None)
+
+            devices: List[str] = []
+            if torch.cuda.is_available():
+                devices.append("cuda")
+            devices.append("cpu")
+
+            last_err: Optional[BaseException] = None
+            for device in devices:
+                for candidate in candidates:
+                    hydra_overrides_extra = [f"++model.image_size={candidate}"] if candidate else []
+                    try:
+                        return build_sam2_video_predictor(
+                            config_file=self.sam2_config_path,
+                            ckpt_path=self.sam2_checkpoint_path,
+                            device=device,
+                            hydra_overrides_extra=hydra_overrides_extra,
+                            apply_postprocessing=True,
+                        )
+                    except torch.cuda.OutOfMemoryError as err:
+                        torch.cuda.empty_cache()
+                        last_err = err
+                        continue
+                    except RuntimeError as err:
+                        if "out of memory" in str(err).lower():
+                            if device == "cuda":
+                                torch.cuda.empty_cache()
+                                last_err = err
+                                continue
+                        raise
+            if last_err:
+                raise last_err
+            raise RuntimeError("failed to initialize SAM2 predictor: no viable device")
+
+        self.predictor = _oom_safe_predictor()
+        self.inference_state = self.predictor.init_state(self.video)
+        video_h = self.inference_state.get('video_height', None)
+        video_w = self.inference_state.get('video_width', None)
+        if video_h is None or video_w is None:
+            raise RuntimeError('SAM2 inference state missing video dimensions')
+        if self.initial_mask is not None:
+            mask_np = self.initial_mask
+            if mask_np.shape[0] != video_h or mask_np.shape[1] != video_w:
+                mask_np = cv2.resize(mask_np, (video_w, video_h), interpolation=cv2.INTER_NEAREST)
+            init_mask = torch.from_numpy((mask_np > 127).astype(np.bool_))
+        else:
+            init_mask = torch.ones((video_h, video_w), dtype=torch.bool)
+        self.predictor.add_new_mask(self.inference_state, frame_idx=0, obj_id=1, mask=init_mask)
+        max_frame_idx = self.inference_state.get('num_frames', 0) - 1
+        start_idx = min(self.start_frame_idx, max(max_frame_idx, 0))
+        self.tracking_iter = self.predictor.propagate_in_video(
+            self.inference_state,
+            start_frame_idx=start_idx,
+        )
+
+    def get_mask(self, frame_idx: int, frame_rgb: np.ndarray) -> Optional[np.ndarray]:
+        if self.tracking_iter is None:
+            raise RuntimeError('SAM2 backend not initialized')
+        try:
+            expected_frame = max(frame_idx - 1, 0)
+            tracked_idx = -1
+            mask_tensor = None
+            while tracked_idx < expected_frame:
+                tracked_idx, _, mask_tensor = next(self.tracking_iter)
+        except StopIteration:
+            return None
+        except torch.cuda.OutOfMemoryError as err:
+            torch.cuda.empty_cache()
+            raise RuntimeError('SAM2 ran out of memory during propagation; reduce mask_infer_max_side or pin the backend to CPU') from err
+        except RuntimeError as err:
+            if 'out of memory' in str(err).lower():
+                torch.cuda.empty_cache()
+                raise RuntimeError('SAM2 ran out of memory during propagation; lower resolution or switch device') from err
+            raise
+
+        if tracked_idx != expected_frame:
+            return None
+
+        self.mask_idx += 1
+        if mask_tensor is None:
+            return None
+
+        if isinstance(mask_tensor, torch.Tensor):
+            mask_np = mask_tensor.detach().cpu().numpy()
+        else:
+            mask_np = np.asarray(mask_tensor)
+
+        while mask_np.ndim > 2:
+            mask_np = mask_np.squeeze(axis=0)
+        if mask_np.ndim == 3:
+            mask_np = mask_np.max(axis=0)
+        mask_np = np.clip(mask_np, 0.0, 1.0)
+        mask_uint8 = (mask_np * 255).astype(np.uint8)
+        if self.blur:
+            mask_uint8 = cv2.GaussianBlur(mask_uint8, (5, 5), sigmaX=1.0)
+        if mask_uint8.shape[:2] != frame_rgb.shape[:2]:
+            mask_uint8 = cv2.resize(mask_uint8, (frame_rgb.shape[1], frame_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return mask_uint8
+
+    def finalize(self) -> None:
+        self.tracking_iter = None
+        self.inference_state = None
+        self.predictor = None
 
 
 def _compute_job_id(video_path: str, projection: str) -> str:
@@ -376,7 +673,8 @@ def process_video(*, video: str, projection: str, masks: List[Dict[str, Any]],
                   crf: int, erode: bool, force_init_mask: bool,
                   reverse_tracking: bool, helpers: Helpers,
                   job_id: Optional[str] = None, job_version: int = 0,
-                  warmup: int = 4, ssim_threshold: float = 0.983) -> str:
+                  warmup: int = 4, ssim_threshold: float = 0.983,
+                  mask_backend_cfg: Optional[MaskBackendConfig] = None) -> str:
     if not masks:
         raise ValueError('mask list is empty')
 
@@ -424,32 +722,48 @@ def process_video(*, video: str, projection: str, masks: List[Dict[str, Any]],
     resume_frame = max(progress.last_frame, _detect_last_mask(mask_dir))
     maskIdx = max(0, min(progress.mask_idx, len(masks)))
 
+    backend_cfg = mask_backend_cfg or MaskBackendConfig()
     prepared_masks = _prepare_manual_masks(masks, prepare_frame, fix_mask2, has_cuda)
 
-    processor_left = _create_processor(has_cuda)
-    processor_right = _create_processor(has_cuda)
-    objects = [1]
+    backend_choice = (backend_cfg.mask_backend or 'matanyone').lower()
+    initial_mask_np = cv2.hconcat([
+        np.array(masks[0]['maskL'], dtype=np.uint8),
+        np.array(masks[0]['maskR'], dtype=np.uint8),
+    ])
+    if backend_choice == 'sam2':
+        config_path = backend_cfg.sam2_config_path or 'sam2_configs/sam2_1_hiera_tiny.yaml'
+        ckpt_path = backend_cfg.sam2_checkpoint_path or 'model/sam2_1_hiera_tiny.pt'
+        backend: MaskBackend = Sam2Backend(
+            video=video,
+            resume_frame=resume_frame,
+            video_width=video_info.width,
+            video_height=video_info.height,
+            infer_max_side=backend_cfg.mask_infer_max_side,
+            sam2_config_path=config_path,
+            sam2_checkpoint_path=ckpt_path,
+            initial_mask=initial_mask_np,
+        )
+    else:
+        backend = MatAnyOneBackend(
+            prepared_masks=prepared_masks,
+            mask_dir=mask_dir,
+            mask_w=mask_w,
+            mask_h=mask_h,
+            reader_config=reader_config,
+            has_cuda=has_cuda,
+            resume_frame=resume_frame,
+            initial_mask_idx=maskIdx,
+            warmup=warmup,
+            ssim_threshold=ssim_threshold,
+            erode=erode,
+            video=video,
+            objects=[1],
+            prepare_frame=prepare_frame,
+            fix_mask2=fix_mask2,
+            force_init_mask=force_init_mask,
+        )
 
-    for idx in range(maskIdx):
-        entry = prepared_masks[idx]
-        processor_left.step(entry['imgLV'], entry['maskL'], objects=objects, force_permanent=True)
-        processor_right.step(entry['imgRV'], entry['maskR'], objects=objects, force_permanent=True)
-
-    _warm_start(
-        processor_left,
-        processor_right,
-        video,
-        reader_config,
-        resume_frame,
-        mask_w,
-        mask_h,
-        has_cuda,
-        objects,
-        mask_dir,
-        prepare_frame,
-        fix_mask2,
-        warmup,
-    )
+    backend.warm_up()
 
     ffmpeg = FFmpegStream(
         video_path=video,
@@ -468,53 +782,18 @@ def process_video(*, video: str, projection: str, masks: List[Dict[str, Any]],
             break
         current_frame += 1
 
-        imgL = frame[:, :mask_w]
-        imgR = frame[:, mask_w:]
-
-        imgLV = prepare_frame(imgL, has_cuda)
-        imgRV = prepare_frame(imgR, has_cuda)
-
-        frame_match = False
-        if force_init_mask and current_frame == 1:
-            frame_match = True
-        if maskIdx < len(prepared_masks):
-            entry = prepared_masks[maskIdx]
-            if ssim(entry['frameLGray'], cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)) > ssim_threshold:
-                if ssim(entry['frameRGray'], cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)) > ssim_threshold:
-                    frame_match = True
-
-        if frame_match:
-            entry = prepared_masks[maskIdx]
-            maskIdx += 1
-            output_prob_L = processor_left.step(imgLV, entry['maskL'], objects=objects)
-            output_prob_R = processor_right.step(imgRV, entry['maskR'], objects=objects)
-            for _ in range(max(warmup, 1)):
-                output_prob_L = processor_left.step(imgLV, first_frame_pred=maskIdx == 1)
-                output_prob_R = processor_right.step(imgRV, first_frame_pred=maskIdx == 1)
-        elif maskIdx > 0:
-            output_prob_L = processor_left.step(imgLV)
-            output_prob_R = processor_right.step(imgRV)
-        else:
+        combined_mask = backend.get_mask(current_frame, frame)
+        if combined_mask is None:
             continue
 
-        mask_output_L = processor_left.output_prob_to_mask(output_prob_L)
-        mask_output_R = processor_right.output_prob_to_mask(output_prob_R)
-
-        mask_output_L_pha = (mask_output_L.unsqueeze(2).cpu().detach().numpy() * 255).astype(np.uint8)
-        mask_output_R_pha = (mask_output_R.unsqueeze(2).cpu().detach().numpy() * 255).astype(np.uint8)
-
-        if erode:
-            mask_output_L_pha = cv2.erode(mask_output_L_pha, (3, 3), iterations=1)
-            mask_output_R_pha = cv2.erode(mask_output_R_pha, (3, 3), iterations=1)
-
-        combined_mask = cv2.hconcat([mask_output_L_pha, mask_output_R_pha])
         mask_path = mask_dir / f"{current_frame:06d}.png"
         cv2.imwrite(str(mask_path), combined_mask)
 
-        progress.update(last_frame=current_frame, mask_idx=maskIdx, total_frames=video_info.length)
+        progress.update(last_frame=current_frame, mask_idx=getattr(backend, 'mask_idx', maskIdx), total_frames=video_info.length)
         set_status(f"Create Mask {current_frame}/{video_info.length}")
 
     ffmpeg.stop()
+    backend.finalize()
 
     tmp_name = f"{os.path.splitext(os.path.basename(video))[0]}_{projection_out.upper()}_alpha_tmp{os.path.splitext(os.path.basename(video))[1]}"
     result_name = f"{os.path.splitext(os.path.basename(video))[0]}_{projection_out.upper()}_alpha{os.path.splitext(os.path.basename(video))[1]}"
