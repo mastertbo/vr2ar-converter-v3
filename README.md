@@ -21,6 +21,8 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
 - Checkpointed processing: resumable mask generation is stored under `/app/process` (backed by the `process-cache` volume) for safe crash recovery.
 - Multi-GPU queue manager: the UI container dispatches pending jobs from `/jobs/pending` to worker-specific folders in `/jobs/workers/<id>`.
 - Worker role support: launch additional containers with `VR2AR_ROLE=worker` to consume dispatched jobs on extra GPUs.
+- Selectable mask backend: choose MatAnyOne or SAM2 in the UI. SAM2 runs at a configurable downscaled resolution (e.g., 2048px long side) and upsamples masks back to your source resolution for 8K-friendly processing.
+- OOM mitigation: SAM2 initialization will retry with progressively smaller inference resolutions and, if needed, fall back to CPU to avoid crashing when GPU memory is exhausted.
 
 ## Existing Mask Workflows
 
@@ -46,5 +48,51 @@ Use the provided container and deploy on device with nvida gpu. Then use the bui
    Use a unique `VR2AR_WORKER_ID` (or rely on the container hostname) and adjust `--gpus` per worker.
 3. The UI automatically detects idle workers and dispatches jobs; results appear in the download list once renders hit `/jobs/completed`.
 4. To scale down, stop the worker containers; queued jobs remain in `/jobs/pending` for the next available worker.
+
+### Vast.ai multi-GPU example
+
+1. Rent a machine with multiple GPUs and ensure the NVIDIA container toolkit is enabled (`--gpus all`).
+2. Start the dispatcher/UI container once, binding the `vr2ar` and `process-cache` volumes.
+3. Launch one worker container per GPU, pinning the device and setting a unique worker ID, for example:
+   ```sh
+   docker run -d \
+     --name vr2ar-worker-0 \
+     --gpus "device=0" \
+     -e VR2AR_ROLE=worker \
+     -e VR2AR_WORKER_ID=worker-0 \
+     -v /path/on/host/vr2ar:/jobs \
+     -v /path/on/host/process-cache:/app/process \
+     ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest
+   docker run -d \
+     --name vr2ar-worker-1 \
+     --gpus "device=1" \
+     -e VR2AR_ROLE=worker \
+     -e VR2AR_WORKER_ID=worker-1 \
+     -v /path/on/host/vr2ar:/jobs \
+     -v /path/on/host/process-cache:/app/process \
+     ghcr.io/michael-mueller-git/vr2ar-converter-v3:latest
+   ```
+4. Submit jobs via the UI; each worker pulls tasks from `/jobs/pending` and writes results to `/jobs/completed`. Jobs that OOM on a GPU will automatically retry at lower SAM2 resolutions (or CPU) before failing.
+
+### Automatic startup on Vast.ai (dispatcher + N workers)
+
+Use the helper script to start the UI/dispatcher and one worker per detected GPU (or an override count):
+
+```sh
+./scripts/vast_autostart.sh               # auto-detects GPU count via nvidia-smi
+VR2AR_WORKER_COUNT=4 ./scripts/vast_autostart.sh  # force exactly 4 workers
+```
+
+- The script runs `docker compose up -d` for the dispatcher and `docker compose up -d --profile worker --scale vr2ar-worker=<count>` for workers.
+- Each worker derives `VR2AR_WORKER_ID` from its container hostname; set `VR2AR_WORKER_COUNT=0` to start only the UI.
+
+Example Vast.ai user-data snippet to auto-start after provisioning:
+
+```sh
+#!/usr/bin/env bash
+git clone https://github.com/michael-mueller-git/vr2ar-converter-v3.git
+cd vr2ar-converter-v3
+VR2AR_WORKER_COUNT=${GPU_COUNT:-$(nvidia-smi --list-gpus | wc -l)} ./scripts/vast_autostart.sh
+```
 
 

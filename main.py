@@ -51,6 +51,7 @@ from data.ffmpegstream import FFmpegStream
 from data.ArVideoWriter import ArVideoWriter
 from video_process import ImageFrame
 import processing_core
+from processing_core import MaskBackendConfig
 from filebrowser_client import FilebrowserClient
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -63,6 +64,11 @@ MASK_RESOLUTION_PRESETS = {
 }
 MASK_RESOLUTION_DEFAULT = "4K (~3840 width)"
 MASK_SIZE = MASK_RESOLUTION_PRESETS[MASK_RESOLUTION_DEFAULT]
+MASK_BACKEND_CHOICES = ["matanyone", "sam2"]
+DEFAULT_MASK_BACKEND = "matanyone"
+DEFAULT_SAM2_MAX_SIDE = 2048
+DEFAULT_SAM2_CONFIG = "sam2_configs/sam2_1_hiera_tiny.yaml"
+DEFAULT_SAM2_CHECKPOINT = "model/sam2_1_hiera_tiny.pt"
 SECONDS = 10
 WARMUP = 4
 JOB_VERSION = 3
@@ -150,12 +156,20 @@ def fix_mask2(mask):
     return mask
 
 @torch.no_grad()
-def process(video, projection, masks, crf = 16, erode = False, force_init_mask=False, job_id: str | None = None):
+def process(video, projection, masks, crf = 16, erode = False, force_init_mask=False, job_id: str | None = None,
+            mask_backend: str = DEFAULT_MASK_BACKEND, mask_infer_max_side: int = DEFAULT_SAM2_MAX_SIDE,
+            sam2_config_path: str = DEFAULT_SAM2_CONFIG, sam2_checkpoint_path: str = DEFAULT_SAM2_CHECKPOINT):
     helpers = {
         'prepare_frame': prepare_frame,
         'fix_mask2': fix_mask2,
         'set_status': _set_worker_status,
     }
+    backend_cfg = MaskBackendConfig(
+        mask_backend=mask_backend,
+        mask_infer_max_side=mask_infer_max_side,
+        sam2_config_path=sam2_config_path,
+        sam2_checkpoint_path=sam2_checkpoint_path,
+    )
     return processing_core.process_video(
         video=video,
         projection=projection,
@@ -169,6 +183,7 @@ def process(video, projection, masks, crf = 16, erode = False, force_init_mask=F
         ssim_threshold=SSIM_THRESHOLD,
         job_id=job_id,
         job_version=JOB_VERSION,
+        mask_backend_cfg=backend_cfg,
     )
 
 @torch.no_grad()
@@ -742,6 +757,13 @@ def _mark_job_failed(job: dict, pkl_path: Path, error: Exception) -> None:
 def _run_job(job: dict) -> Optional[str]:
     mode = (job.get('job_mode') or 'generate').lower()
 
+    backend_kwargs = {
+        'mask_backend': job.get('mask_backend', DEFAULT_MASK_BACKEND),
+        'mask_infer_max_side': job.get('mask_infer_max_side', DEFAULT_SAM2_MAX_SIDE),
+        'sam2_config_path': job.get('sam2_config_path', DEFAULT_SAM2_CONFIG),
+        'sam2_checkpoint_path': job.get('sam2_checkpoint_path', DEFAULT_SAM2_CHECKPOINT),
+    }
+
     if mode == 'stitch':
         mask_dir = job.get('existing_mask_dir')
         if not mask_dir:
@@ -791,6 +813,7 @@ def _run_job(job: dict) -> Optional[str]:
             job['erode'],
             job['forceInitMask'],
             job_id=job.get('job_id'),
+            **backend_kwargs,
         )
 
     if job.get('reverseTracking'):
@@ -811,6 +834,7 @@ def _run_job(job: dict) -> Optional[str]:
         job['erode'],
         job['forceInitMask'],
         job_id=job.get('job_id'),
+        **backend_kwargs,
     )
 
 
@@ -980,9 +1004,18 @@ def background_worker():
 
 
 def add_job(video, projection, crf, erode, forceInitMask, reverseTracking,
-            job_mode, existing_mask_dir, existing_mask_stride):
+            job_mode, existing_mask_dir, existing_mask_stride,
+            mask_backend_choice, sam2_max_side, sam2_config_path, sam2_checkpoint_path):
     RETURN_VALUES = 16
     mode = (job_mode or 'generate').lower()
+
+    backend_name = (mask_backend_choice or DEFAULT_MASK_BACKEND).lower()
+    try:
+        sam2_max_side_value = int(sam2_max_side or DEFAULT_SAM2_MAX_SIDE)
+    except (TypeError, ValueError):
+        sam2_max_side_value = DEFAULT_SAM2_MAX_SIDE
+    sam2_config_value = sam2_config_path or DEFAULT_SAM2_CONFIG
+    sam2_checkpoint_value = sam2_checkpoint_path or DEFAULT_SAM2_CHECKPOINT
 
     if video is None:
         gr.Warning("Could not add Job: Video not found", duration=5)
@@ -1083,6 +1116,10 @@ def add_job(video, projection, crf, erode, forceInitMask, reverseTracking,
         'job_mode': mode,
         'existing_mask_dir': str(mask_directory) if mask_directory else None,
         'existing_mask_stride': stride_value,
+        'mask_backend': backend_name,
+        'mask_infer_max_side': sam2_max_side_value,
+        'sam2_config_path': sam2_config_value,
+        'sam2_checkpoint_path': sam2_checkpoint_value,
     }
 
     job_pkl_path = PENDING_JOBS_DIR / f"{ts}.pkl"
@@ -1843,6 +1880,10 @@ with gr.Blocks(**_BLOCKS_KWARGS) as demo:
         erode_checkbox = gr.Checkbox(label="Erode Mask Output", value=True, info="")
         force_init_mask_checkbox = gr.Checkbox(label="Force Init Mask", value=False, info="")
         reverse_tracking_checkbox = gr.Checkbox(label="Reverse Tracking (caches mask for all frames inside /app/process until completed!)", value=True, info="")
+        mask_backend_dropdown = gr.Dropdown(choices=MASK_BACKEND_CHOICES, value=DEFAULT_MASK_BACKEND, label="Mask Backend")
+        sam2_max_side_input = gr.Number(label="SAM2 Inference Max Side", value=DEFAULT_SAM2_MAX_SIDE, precision=0)
+        sam2_config_path_input = gr.Textbox(label="SAM2 Config Path", value=DEFAULT_SAM2_CONFIG)
+        sam2_checkpoint_path_input = gr.Textbox(label="SAM2 Checkpoint Path", value=DEFAULT_SAM2_CHECKPOINT)
         job_mode_radio = gr.Radio(
             choices=["generate", "refine", "stitch"],
             value="generate",
@@ -1863,7 +1904,7 @@ with gr.Blocks(**_BLOCKS_KWARGS) as demo:
         add_button = gr.Button("Add Job")
         add_button.click(
             fn=add_job,
-            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox, force_init_mask_checkbox, reverse_tracking_checkbox, job_mode_radio, existing_mask_dir_input, existing_mask_stride_input],
+            inputs=[input_video, projection_dropdown, crf_dropdown, erode_checkbox, force_init_mask_checkbox, reverse_tracking_checkbox, job_mode_radio, existing_mask_dir_input, existing_mask_stride_input, mask_backend_dropdown, sam2_max_side_input, sam2_config_path_input, sam2_checkpoint_path_input],
             outputs=[input_video, framePreviewL, framePreviewR, maskPreviewL, mergedMaskL, maskPreviewR, mergedMaskR, maskL, maskR, maskSelectionL, maskSelectionR, previewMergedMask, exampleL, exampleR, postprocessedMaskL, postprocessedMaskR]
         )
 
